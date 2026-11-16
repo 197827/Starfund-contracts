@@ -6,7 +6,7 @@
 - **Status:** **Published to GitHub (All 240 Wave 9 & Wave 10 Issues Live)**
 - **Active / Unpublished Backlog Remaining:** **0** (all issues published)
 - **Publication Waves:**
-  - **Wave 9 Batch 1 (#1–#50):** Published as GitHub issues **#20 through #69**, archived in [`drips wave 9.md`](../drips%20wave%209.md).
+  - **Wave 9 Batch 1 (#1–#50):** Published as GitHub issues **#20 through #69**, publication status recorded in [`drips wave backlog.md`](../drips%20wave%20backlog.md).
   - **Wave 9 Batch 2 (#51–#110):** Published as GitHub issues **#70 through #129**, detailed below with full technical descriptions and GitHub issue links.
   - **Wave 10 Batch 1 (#111–#140):** Published as GitHub issues **#164 through #193**.
   - **Wave 10 Batch 2 (#141–#190):** Published as GitHub issues **#244 through #293**.

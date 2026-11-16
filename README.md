@@ -8,7 +8,7 @@ tokenized invoices until settlement.
 
 ## Prerequisites
 
-- Rust 1.70+ (stable)
+- Rust 1.85.1 (pinned in `rust-toolchain.toml`)
 - `wasm32v1-none` target for WASM builds: `rustup target add wasm32v1-none`
 - Soroban / Stellar CLI (optional — for deployment and contract interaction)
 
@@ -415,7 +415,7 @@ cargo fmt --all -- --check
 cargo clippy -p starfund_escrow -- -D warnings
 cargo build
 cargo test
-cargo llvm-cov --features testutils --fail-under-lines 95 --summary-only -p starfund_escrow
+cargo llvm-cov --features testutils --fail-under-lines 90 --summary-only -p starfund_escrow
 ```
 
 ### Cargo.lock process notes

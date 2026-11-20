@@ -83,6 +83,37 @@
 //! for this contract and must not be used on-chain as proof of registry state without calling the
 //! registry yourself.
 //!
+//! ### Funding token decimal metadata failures at `init`
+//!
+//! [`StarfundEscrow::init`] reads the funding token's SEP-41 `decimals()` metadata to pin the
+//! token's decimal scale. That read is a live cross-contract call, so a token that does not
+//! implement the SEP-41 metadata ABI can fail in several ways:
+//!
+//! - **Missing `decimals`** ΓÇö the token has no `decimals` entrypoint (host reports a missing
+//!   function / unknown method).
+//! - **Wrong return type** ΓÇö `decimals` exists but does not return a `u32` (ABI mismatch).
+//! - **Contract error** ΓÇö the token traps or returns a contract error from `decimals`.
+//!
+//! **Public failure behavior:** in every case the `init` invocation fails (traps) and **no
+//! escrow state is persisted** ΓÇö [`DataKey::Escrow`], [`DataKey::Version`], the funding token,
+//! and all other init-written keys remain unset, and no lifecycle event is emitted. The failure
+//! surfaces as the host's cross-contract-call error (missing entrypoint / conversion failure /
+//! token error), **not** as a guaranteed [`EscrowError`] code: this contract does not wrap the
+//! metadata read in a typed error, so integrators must not branch on an invented code. Callers
+//! should treat any `init` failure as "not initialized" and retry with a SEP-41-compliant token.
+//! See `decimal_scale_tests` for the registered fixtures covering each failure mode.
+//!
+//! ## Investor index ceiling (supported configuration)
+//!
+//! [`DataKey::InvestorIndex`] is a single instance-storage `Vec<Address>`. [`StarfundEscrow::init`]
+//! rejects a configured `max_unique_investors` above [`SUPPORTED_MAX_UNIQUE_INVESTORS`] with
+//! [`EscrowError::MaxUniqueInvestorsExceedsSupported`] before persisting anything; the
+//! unconditional [`MAX_UNIQUE_INVESTORS`] hard cap still bounds funding for every escrow. Escrows
+//! initialized before this check may hold a larger stored cap: they are not migrated, remain
+//! readable, and may fail on the first index append that exceeds instance-storage limits ΓÇö treat
+//! that as the effective ceiling and redeploy. A paged `InvestorIndex` (like the allowlist pages)
+//! is required to support a higher ceiling.
+//!
 //! ## Terminal dust sweep
 //!
 //! [`StarfundEscrow::sweep_terminal_dust`] moves at most [`MAX_DUST_SWEEP_AMOUNT`] units of the
@@ -478,6 +509,34 @@ pub const ALLOWLIST_PAGE_SIZE: u32 = 50;
 /// default host budget.
 pub const MAX_UNIQUE_INVESTORS: u32 = 10_000;
 
+/// Supported ceiling for a **configured** `max_unique_investors` value at
+/// [`StarfundEscrow::init`] (issue #421).
+///
+/// [`DataKey::InvestorIndex`] is a single **instance**-storage `Vec<Address>`, so every
+/// distinct investor appended to it grows one instance ledger entry. Instance storage is
+/// bounded by the host's per-entry size limit, which is reached well before
+/// [`MAX_UNIQUE_INVESTORS`] distinct addresses are recorded. Measurements in
+/// `release_budget_tests` (growing distinct investors under realistic ledger limits) show
+/// the first failure occurs when the serialized index approaches the instance-entry size
+/// ceiling; [`SUPPORTED_MAX_UNIQUE_INVESTORS`] is set with a safety margin below that point.
+///
+/// `init` rejects a configured `max_unique_investors` above this value with
+/// [`EscrowError::MaxUniqueInvestorsExceedsSupported`] **before any state is persisted**.
+/// The unconditional [`MAX_UNIQUE_INVESTORS`] hard cap in `fund_impl` is unchanged, so
+/// existing escrows below the supported ceiling keep byte-for-byte behavior.
+///
+/// # Legacy handling
+///
+/// Escrows initialized before this check existed may have a stored cap above
+/// [`SUPPORTED_MAX_UNIQUE_INVESTORS`]. They are **not** migrated or rejected retroactively:
+/// reads keep returning the stored cap, and funding continues to be bounded by
+/// [`MAX_UNIQUE_INVESTORS`]. Such instances may hit the instance-storage limit while
+/// appending to [`DataKey::InvestorIndex`]; operators should treat the first append failure
+/// as the effective ceiling and redeploy with a supported cap. A paged representation of
+/// `InvestorIndex` (mirroring [`ALLOWLIST_PAGE_SIZE`] paging) is the forward path if a
+/// higher supported ceiling is required.
+pub const SUPPORTED_MAX_UNIQUE_INVESTORS: u32 = 1_000;
+
 /// Documented worst-case **release-path** resource ceilings (issue #1229).
 ///
 /// These are the per-top-level-invocation CPU-instruction and memory-bytes budgets that every
@@ -686,6 +745,13 @@ pub enum EscrowError {
     MinContributionExceedsAmount = 7,
     /// [`StarfundEscrow::init`] configured `max_unique_investors` but it is not positive.
     MaxUniqueInvestorsNotPositive = 8,
+    /// [`StarfundEscrow::init`] configured `max_unique_investors` above
+    /// [`SUPPORTED_MAX_UNIQUE_INVESTORS`], which the single-entry
+    /// [`DataKey::InvestorIndex`] cannot hold within instance-storage limits.
+    ///
+    /// Rejected before any state is persisted. See [`SUPPORTED_MAX_UNIQUE_INVESTORS`] for
+    /// the measurement-backed ceiling and legacy handling.
+    MaxUniqueInvestorsExceedsSupported = 285,
     /// [`StarfundEscrow::init`] configured `max_per_investor` but it is not positive.
     MaxPerInvestorNotPositive = 9,
     /// [`StarfundEscrow::init`] rejected a tier with `yield_bps` outside `0..=10_000`.

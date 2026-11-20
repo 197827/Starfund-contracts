@@ -343,6 +343,115 @@ fn test_refund_wrong_signer_panics() {
     client.refund(&investor);
 }
 
+// ── get_contributions positional parity ─────────────────────────────────
+
+/// Generated positional-parity check for `get_contributions`.
+///
+/// Builds a mix of funded investors, exited (refunded) investors and unknown
+/// addresses, then reads them back through `get_contributions` in batches that
+/// include duplicates and unknowns. Every batch slot must equal the single
+/// `get_contribution` result for the address at that same input position.
+#[test]
+fn test_get_contributions_positional_parity_with_duplicates_and_unknowns() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.init(
+        &admin,
+        &SorobanString::from_str(&env, "AUTH_PARITY"),
+        &sme,
+        &1_000_000_000i128,
+        &800i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    // Funded investors (status 1).
+    let funded_a = Address::generate(&env);
+    let funded_b = Address::generate(&env);
+    client.fund(&funded_a, &10_000i128);
+    client.fund(&funded_b, &25_000i128);
+
+    // Exited investors: fund, then cancel funding and refund to reach status 4.
+    let exited_a = Address::generate(&env);
+    let exited_b = Address::generate(&env);
+    client.fund(&exited_a, &5_000i128);
+    client.fund(&exited_b, &7_500i128);
+    client.cancel_funding(&0u32);
+    client.refund(&exited_a);
+    client.refund(&exited_b);
+
+    // Unknown addresses that never interacted with the escrow.
+    let unknown_a = Address::generate(&env);
+    let unknown_b = Address::generate(&env);
+
+    // Build an input batch with duplicates and unknowns interleaved.
+    let inputs = SorobanVec::from_array(
+        &env,
+        [
+            funded_a.clone(),
+            unknown_a.clone(),
+            funded_b.clone(),
+            funded_a.clone(),
+            exited_a.clone(),
+            unknown_b.clone(),
+            exited_b.clone(),
+            exited_a.clone(),
+            funded_b.clone(),
+            unknown_a.clone(),
+        ],
+    );
+
+    let outputs = client.get_contributions(&inputs);
+    assert_eq!(
+        outputs.len(),
+        inputs.len(),
+        "output length must equal input length"
+    );
+
+    // Every slot must match the single getter for the same input position.
+    for i in 0..inputs.len() {
+        let addr = inputs.get(i).unwrap();
+        let expected = client.get_contribution(&addr);
+        assert_eq!(
+            outputs.get(i).unwrap(),
+            expected,
+            "batch slot {} disagrees with get_contribution",
+            i
+        );
+    }
+
+    // Duplicate positions repeat the same value.
+    assert_eq!(outputs.get(0).unwrap(), outputs.get(3).unwrap());
+    assert_eq!(outputs.get(2).unwrap(), outputs.get(8).unwrap());
+    assert_eq!(outputs.get(4).unwrap(), outputs.get(7).unwrap());
+    assert_eq!(outputs.get(1).unwrap(), outputs.get(9).unwrap());
+
+    // Unknown addresses report zero contribution.
+    assert_eq!(outputs.get(1).unwrap(), 0i128);
+    assert_eq!(outputs.get(5).unwrap(), 0i128);
+
+    // Empty input returns empty output.
+    let empty_inputs: SorobanVec<Address> = SorobanVec::new(&env);
+    let empty_outputs = client.get_contributions(&empty_inputs);
+    assert_eq!(empty_outputs.len(), 0u32);
+}
+
 // ── sweep_terminal_dust ─────────────────────────────────────────────────
 
 /// Calling `sweep_terminal_dust` with no authorization panics at the

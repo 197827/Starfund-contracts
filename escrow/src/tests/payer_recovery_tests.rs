@@ -114,6 +114,92 @@ fn test_propose_payer_recovery_same_payer_fails() {
 }
 
 #[test]
+fn test_propose_payer_recovery_self_address_fails_before_writes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+
+    let (token, treasury) = free_addresses(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "PAYER_REC_014"),
+        &sme,
+        &100_000_000_000i128,
+        &500i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    // Propose the current payer as the new payer: must be rejected.
+    assert_contract_error(
+        client.try_propose_payer_recovery(&admin, &None),
+        EscrowError::NewPayerSameAsCurrent,
+    );
+
+    // No writes: payer unchanged and no pending proposal recorded.
+    let escrow = client.get_escrow();
+    assert_eq!(escrow.payer, admin);
+    assert_contract_error(
+        client.try_accept_payer_recovery(),
+        EscrowError::NoPendingPayer,
+    );
+}
+
+#[test]
+fn test_propose_payer_recovery_valid_new_payer_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, sme) = setup(&env);
+
+    let (token, treasury) = free_addresses(&env);
+    client.init(
+        &admin,
+        &String::from_str(&env, "PAYER_REC_015"),
+        &sme,
+        &100_000_000_000i128,
+        &500i64,
+        &0u64,
+        &token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    // A distinct valid address is accepted as a recovery nomination.
+    let new_payer = Address::generate(&env);
+    assert_ne!(new_payer, admin);
+    let result = client.propose_payer_recovery(&new_payer, &None);
+    assert_eq!(result, new_payer);
+
+    // Payer is still unchanged until acceptance.
+    let escrow = client.get_escrow();
+    assert_eq!(escrow.payer, admin);
+
+    // The proposal can be accepted and updates the payer.
+    let updated_escrow = client.accept_payer_recovery();
+    assert_eq!(updated_escrow.payer, new_payer);
+}
+
+#[test]
 fn test_propose_payer_recovery_not_open_fails() {
     let env = Env::default();
     env.mock_all_auths();

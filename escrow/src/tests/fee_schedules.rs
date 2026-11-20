@@ -1,35 +1,17 @@
-use super::{free_addresses, setup};
+use super::{decode_events, setup, TestConfig};
 use crate::{FeeSchedule, FeeScheduleActivated, FeeScheduleSubmitted, StarfundEscrowClient};
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Events as _, Ledger as _},
-    Address, Env, String,
+    testutils::{Ledger as _},
+    Address, Env,
 };
 
 fn init_fee_schedule_test<'a>(env: &'a Env) -> (StarfundEscrowClient<'a>, Address) {
     let (client, admin, sme) = setup(env);
-    let (funding_token, treasury) = free_addresses(env);
-    client.init(
-        &admin,
-        &String::from_str(env, "FEES01"),
-        &sme,
-        &100_000i128,
-        &800i64,
-        &0u64,
-        &funding_token,
-        &None,
-        &treasury,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None::<i64>,
-        &None::<u32>,
-    );
+    TestConfig::new(env, "FEES01", &sme)
+        .amount(100_000i128)
+        .maturity(800i64)
+        .init(&client, &admin);
     (client, admin)
 }
 
@@ -46,14 +28,19 @@ fn fee_schedule_changes_emit_events() {
     };
 
     client.submit_fee_schedule(&first);
+    let submitted = decode_events::<FeeScheduleSubmitted>(
+        &env,
+        &contract_id,
+        symbol_short!("fee_sub"),
+    );
+    assert_eq!(submitted.len(), 1);
     assert_eq!(
-        env.events().all().events().last().unwrap().clone(),
+        submitted[0],
         FeeScheduleSubmitted {
             name: symbol_short!("fee_sub"),
             invoice_id: client.get_escrow().invoice_id,
             schedule: first.clone(),
         }
-        .to_xdr(&env, &contract_id)
     );
 
     let event_count = env.events().all().events().len();
@@ -64,15 +51,20 @@ fn fee_schedule_changes_emit_events() {
     ledger.sequence_number = first.activation_ledger;
     env.ledger().set(ledger);
     assert!(client.activate_fee_schedule());
+    let activated = decode_events::<FeeScheduleActivated>(
+        &env,
+        &contract_id,
+        symbol_short!("fee_act"),
+    );
+    assert_eq!(activated.len(), 1);
     assert_eq!(
-        env.events().all().events().last().unwrap().clone(),
+        activated[0],
         FeeScheduleActivated {
             name: symbol_short!("fee_act"),
             invoice_id: client.get_escrow().invoice_id,
             schedule: first.clone(),
             previous: None,
         }
-        .to_xdr(&env, &contract_id)
     );
 
     let second = FeeSchedule {
@@ -86,14 +78,19 @@ fn fee_schedule_changes_emit_events() {
     ledger.sequence_number = second.activation_ledger;
     env.ledger().set(ledger);
     assert!(client.activate_fee_schedule());
+    let activated = decode_events::<FeeScheduleActivated>(
+        &env,
+        &contract_id,
+        symbol_short!("fee_act"),
+    );
+    assert_eq!(activated.len(), 2);
     assert_eq!(
-        env.events().all().events().last().unwrap().clone(),
+        activated[1],
         FeeScheduleActivated {
             name: symbol_short!("fee_act"),
             invoice_id: client.get_escrow().invoice_id,
             schedule: second,
             previous: Some(first),
         }
-        .to_xdr(&env, &contract_id)
     );
 }

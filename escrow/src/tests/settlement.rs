@@ -18,8 +18,9 @@
 
 #[cfg(test)]
 use super::{
-    assert_contract_error, default_init, deploy, deploy_with_id, free_addresses,
-    install_stellar_asset_token, setup, StellarTestToken, MAX_DUST_SWEEP_AMOUNT, TARGET,
+    assert_contract_error, assert_event_count, decode_contract_event, default_init, deploy,
+    deploy_with_id, free_addresses, install_stellar_asset_token, setup, TestConfig,
+    StellarTestToken, MAX_DUST_SWEEP_AMOUNT, TARGET,
 };
 use crate::{
     EscrowError, EscrowSettled, InvoiceEscrow, StarfundEscrow, SettlementConfig,
@@ -56,33 +57,11 @@ fn setup_claim_env<'a>(
     Address,
 ) {
     env.mock_all_auths();
-    let token = install_stellar_asset_token(env);
-    let (contract_id, client) = deploy_with_id(env);
-    let admin = Address::generate(env);
-    let sme = Address::generate(env);
-    let treasury = Address::generate(env);
-
-    client.init(
-        &admin,
-        &String::from_str(env, invoice_id),
-        &sme,
-        &target,
-        &yield_bps,
-        &0u64,
-        &token.id,
-        &None,
-        &treasury,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
-
+    let config = TestConfig::new()
+        .invoice_id(invoice_id)
+        .target(target)
+        .yield_bps(yield_bps);
+    let (client, token, contract_id, treasury) = config.deploy_with_token(env);
     (client, token, contract_id, treasury)
 }
 
@@ -97,36 +76,13 @@ fn setup_funded_with_token<'a>(
     StellarAssetClient<'a>,
 ) {
     env.mock_all_auths();
-    let sac = env.register_stellar_asset_contract_v2(Address::generate(env));
-    let token_id = sac.address();
-    let sac_admin = StellarAssetClient::new(env, &token_id);
-
-    let escrow_id = env.register(StarfundEscrow, ());
-    let client = super::StarfundEscrowClient::new(env, &escrow_id);
-    let admin = Address::generate(env);
-    let sme = Address::generate(env);
-    let treasury = Address::generate(env);
-
-    client.init(
-        &admin,
-        &soroban_sdk::String::from_str(env, "INV_TOK"),
-        &sme,
-        &TARGET,
-        &800i64,
-        &0u64,
-        &token_id,
-        &None,
-        &treasury,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
+    let config = TestConfig::new()
+        .invoice_id("INV_TOK")
+        .target(TARGET)
+        .yield_bps(800i64);
+    let (client, token, _contract_id, _treasury) = config.deploy_with_token(env);
+    let sac_admin = StellarAssetClient::new(env, &token.id);
+    let sme = client.get_escrow().sme;
 
     // Mint tokens to investor so fund() can transfer them into the escrow.
     let investor = Address::generate(env);
@@ -218,19 +174,21 @@ fn withdraw_emits_event() {
     client.withdraw();
 
     // Snapshot immediately: the event buffer retains only the latest invocation.
-    // Token transfer events may also appear; the escrow `SmeWithdrew` is last.
-    let events = env.events().all();
+    // Token transfer events may also appear; select the escrow `SmeWithdrew` by
+    // contract and symbol so unrelated events cannot be mistaken for it.
+    let decoded: SmeWithdrew = decode_contract_event(&env, &contract_id, symbol_short!("sme_wd"));
     assert_eq!(
-        events.events().last().unwrap().clone(),
+        decoded,
         SmeWithdrew {
             name: symbol_short!("sme_wd"),
             invoice_id,
             amount: TARGET,
             recipient: sme,
             fee: 0,
-        }
-        .to_xdr(&env, &contract_id)
+        },
+        "SmeWithdrew payload must carry the net payout"
     );
+    assert_event_count(&env, &contract_id, symbol_short!("sme_wd"), 1);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1774,31 +1732,12 @@ fn settled_at_recorded_at_settle() {
 fn settle_rejects_insufficient_contract_balance() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, admin, sme) = setup(&env);
+    let config = TestConfig::new()
+        .invoice_id("INSUFFICIENT")
+        .target(TARGET)
+        .yield_bps(500i64);
+    let (client, token, _contract_id, _treasury) = config.deploy_with_token(&env);
     let investor = Address::generate(&env);
-    let token = install_stellar_asset_token(&env);
-    let treasury = Address::generate(&env);
-
-    client.init(
-        &admin,
-        &soroban_sdk::String::from_str(&env, "INSUFFICIENT"),
-        &sme,
-        &TARGET,
-        &500i64,
-        &0u64,
-        &token.id,
-        &None,
-        &treasury,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
 
     token.stellar.mint(&investor, &TARGET);
     client.fund(&investor, &TARGET);
@@ -1860,37 +1799,14 @@ fn settled_at_recorded_with_maturity() {
     env.mock_all_auths();
 
     let maturity: u64 = 5_000;
-    let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
-    let token_id = sac.address();
-    let sac_admin = StellarAssetClient::new(&env, &token_id);
-    let (escrow_id, client2) = super::deploy_with_id(&env);
-    let (admin2, sme2, treasury2) = (
-        Address::generate(&env),
-        Address::generate(&env),
-        Address::generate(&env),
-    );
-    client2.init(
-        &admin2,
-        &soroban_sdk::String::from_str(&env, "MAT001"),
-        &sme2,
-        &TARGET,
-        &500i64,
-        &maturity,
-        &token_id,
-        &None,
-        &treasury2,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-
-    );
+    let config = TestConfig::new()
+        .invoice_id("MAT001")
+        .target(TARGET)
+        .yield_bps(500i64)
+        .maturity(maturity);
+    let (client2, token, _contract_id, _treasury) = config.deploy_with_token(&env);
     let investor = Address::generate(&env);
-    sac_admin.mint(&investor, &TARGET);
+    token.stellar.mint(&investor, &TARGET);
     client2.fund(&investor, &TARGET);
 
     // Advance ledger past maturity.
@@ -1964,34 +1880,15 @@ fn test_commitment_second_deposit_rejected() {
 fn test_commitment_lock_past_maturity_rejected() {
     let env = Env::default();
     env.mock_all_auths();
-    let token = install_stellar_asset_token(&env);
-    let (_contract_id, client) = deploy_with_id(&env);
-    let admin = Address::generate(&env);
-    let sme = Address::generate(&env);
-    let treasury = Address::generate(&env);
 
     env.ledger().set_timestamp(1000);
 
-    client.init(
-        &admin,
-        &String::from_str(&env, "CLT003"),
-        &sme,
-        &10_000i128,
-        &800i64,
-        &2000u64,
-        &token.id,
-        &None,
-        &treasury,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
+    let config = TestConfig::new()
+        .invoice_id("CLT003")
+        .target(10_000i128)
+        .yield_bps(800i64)
+        .maturity(2000u64);
+    let (client, _token, _contract_id, _treasury) = config.deploy_with_token(&env);
 
     let inv = Address::generate(&env);
     assert_contract_error(
@@ -2006,11 +1903,6 @@ fn test_commitment_lock_past_maturity_rejected() {
 fn test_commitment_effective_yield_reflects_tier() {
     let env = Env::default();
     env.mock_all_auths();
-    let token = install_stellar_asset_token(&env);
-    let (_contract_id, client) = deploy_with_id(&env);
-    let admin = Address::generate(&env);
-    let sme = Address::generate(&env);
-    let treasury = Address::generate(&env);
     let inv = Address::generate(&env);
 
     let mut tiers: SorobanVec<YieldTier> = SorobanVec::new(&env);
@@ -2019,26 +1911,12 @@ fn test_commitment_effective_yield_reflects_tier() {
         yield_bps: 1000,
     });
 
-    client.init(
-        &admin,
-        &String::from_str(&env, "CLT004"),
-        &sme,
-        &10_000i128,
-        &800i64,
-        &0u64,
-        &token.id,
-        &None,
-        &treasury,
-        &Some(tiers),
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
+    let config = TestConfig::new()
+        .invoice_id("CLT004")
+        .target(10_000i128)
+        .yield_bps(800i64)
+        .yield_tiers(tiers);
+    let (client, token, _contract_id, _treasury) = config.deploy_with_token(&env);
 
     token.stellar.mint(&inv, &5_000i128);
     client.fund_with_commitment(&inv, &5_000i128, &100u64);
@@ -2067,26 +1945,12 @@ fn test_is_settleable_funded_before_maturity() {
     let sme = Address::generate(&env);
     let treasury = Address::generate(&env);
     let maturity: u64 = 5_000;
-    client.init(
-        &admin,
-        &soroban_sdk::String::from_str(&env, "MAT001"),
-        &sme,
-        &TARGET,
-        &500i64,
-        &maturity,
-        &token.id,
-        &None,
-        &treasury,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
+    let config = TestConfig::new()
+        .invoice_id("MAT001")
+        .target(TARGET)
+        .yield_bps(500i64)
+        .maturity(maturity);
+    let (client, token, _contract_id, _treasury) = config.deploy_with_token(&env);
     let investor = Address::generate(&env);
     token.stellar.mint(&investor, &TARGET);
     client.fund(&investor, &TARGET);
@@ -2107,26 +1971,12 @@ fn test_is_settleable_funded_exact_maturity() {
     let sme = Address::generate(&env);
     let treasury = Address::generate(&env);
     let maturity: u64 = 5_000;
-    client.init(
-        &admin,
-        &soroban_sdk::String::from_str(&env, "MAT002"),
-        &sme,
-        &TARGET,
-        &500i64,
-        &maturity,
-        &token.id,
-        &None,
-        &treasury,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
+    let config = TestConfig::new()
+        .invoice_id("MAT002")
+        .target(TARGET)
+        .yield_bps(500i64)
+        .maturity(maturity);
+    let (client, token, _contract_id, _treasury) = config.deploy_with_token(&env);
     let investor = Address::generate(&env);
     token.stellar.mint(&investor, &TARGET);
     client.fund(&investor, &TARGET);
@@ -2147,26 +1997,12 @@ fn test_is_settleable_funded_after_maturity() {
     let sme = Address::generate(&env);
     let treasury = Address::generate(&env);
     let maturity: u64 = 5_000;
-    client.init(
-        &admin,
-        &soroban_sdk::String::from_str(&env, "MAT003"),
-        &sme,
-        &TARGET,
-        &500i64,
-        &maturity,
-        &token.id,
-        &None,
-        &treasury,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
+    let config = TestConfig::new()
+        .invoice_id("MAT003")
+        .target(TARGET)
+        .yield_bps(500i64)
+        .maturity(maturity);
+    let (client, token, _contract_id, _treasury) = config.deploy_with_token(&env);
     let investor = Address::generate(&env);
     token.stellar.mint(&investor, &TARGET);
     client.fund(&investor, &TARGET);
@@ -2322,32 +2158,13 @@ fn test_settlement_readiness_maturity_gate_parity() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let client = deploy(&env);
-    let admin = Address::generate(&env);
-    let sme = Address::generate(&env);
-    let (token, treasury) = free_addresses(&env);
-
     let maturity: u64 = 20_000;
-    client.init(
-        &admin,
-        &String::from_str(&env, "INV_RDY_MAT"),
-        &sme,
-        &TARGET,
-        &800i64,
-        &maturity,
-        &token,
-        &None,
-        &treasury,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
+    let config = TestConfig::new()
+        .invoice_id("INV_RDY_MAT")
+        .target(TARGET)
+        .yield_bps(800i64)
+        .maturity(maturity);
+    let (client, _token, _contract_id, _treasury) = config.deploy_with_token(&env);
     fund_to_target(&client, &env);
 
     // Pre-maturity: not reached, not ready.
@@ -3484,32 +3301,13 @@ fn settlement_config_reflects_maturity() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let client = deploy(&env);
-    let admin = Address::generate(&env);
-    let sme = Address::generate(&env);
-    let (token, treasury) = free_addresses(&env);
-
     let maturity = 100_000u64;
-    client.init(
-        &admin,
-        &String::from_str(&env, "INV_CFG_004"),
-        &sme,
-        &TARGET,
-        &600i64,
-        &maturity,
-        &token,
-        &None,
-        &treasury,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
+    let config = TestConfig::new()
+        .invoice_id("INV_CFG_004")
+        .target(TARGET)
+        .yield_bps(600i64)
+        .maturity(maturity);
+    let (client, _token, _contract_id, _treasury) = config.deploy_with_token(&env);
 
     let config = client.get_settlement_config();
     assert_eq!(config.maturity, maturity);
@@ -3521,31 +3319,11 @@ fn settlement_config_is_pure_read_only() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let client = deploy(&env);
-    let admin = Address::generate(&env);
-    let sme = Address::generate(&env);
-    let (token, treasury) = free_addresses(&env);
-
-    client.init(
-        &admin,
-        &String::from_str(&env, "INV_CFG_005"),
-        &sme,
-        &TARGET,
-        &400i64,
-        &0u64,
-        &token,
-        &None,
-        &treasury,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
+    let config = TestConfig::new()
+        .invoice_id("INV_CFG_005")
+        .target(TARGET)
+        .yield_bps(400i64);
+    let (client, _token, _contract_id, _treasury) = config.deploy_with_token(&env);
 
     let before = client.get_settlement_config();
     let _ = client.get_settlement_config(); // call twice
@@ -3571,31 +3349,12 @@ fn setup_yield_bps_test<'a>(
     li.timestamp = 1_000;
     env.ledger().set(li);
 
-    let client = deploy(env);
-    let admin = Address::generate(env);
-    let sme = Address::generate(env);
-    let (token, treasury) = free_addresses(env);
-
-    client.init(
-        &admin,
-        &String::from_str(env, invoice_id),
-        &sme,
-        &TARGET,
-        &yield_bps,
-        &0u64,
-        &token,
-        &None,
-        &treasury,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None);
+    let config = TestConfig::new()
+        .invoice_id(invoice_id)
+        .target(TARGET)
+        .yield_bps(yield_bps);
+    let (client, _token, _contract_id, _treasury) = config.deploy_with_token(env);
+    let admin = client.get_escrow().admin;
 
     (client, admin)
 }
@@ -3809,20 +3568,20 @@ fn update_yield_bps_emits_event() {
 
     client.update_yield_bps(&900i64);
 
-    let all_events = env.events().all();
+    let decoded: YieldBpsUpdatedEvent =
+        decode_contract_event(&env, &contract_id, symbol_short!("yld_upd"));
     let expected = YieldBpsUpdatedEvent {
         name: symbol_short!("yld_upd"),
         invoice_id: client.get_escrow().invoice_id,
         old_yield_bps: 500i64,
         new_yield_bps: 900i64,
-    }
-    .to_xdr(&env, &contract_id);
+    };
 
     assert_eq!(
-        all_events.events().last().unwrap().clone(),
-        expected,
-        "last event must be YieldBpsUpdatedEvent with correct fields"
+        decoded, expected,
+        "YieldBpsUpdatedEvent must carry the correct fields"
     );
+    assert_event_count(&env, &contract_id, symbol_short!("yld_upd"), 1);
 }
 
 /// Event must carry the correct `old_yield_bps` when multiple updates are made
@@ -3842,16 +3601,17 @@ fn update_yield_bps_event_carries_correct_old_value_on_second_update() {
     // Second update: 600 → 1000 — old_yield_bps must be 600, not 300
     client.update_yield_bps(&1_000i64);
 
-    let all_events = env.events().all();
+    let decoded: YieldBpsUpdatedEvent =
+        decode_contract_event(&env, &contract_id, symbol_short!("yld_upd"));
     let expected = YieldBpsUpdatedEvent {
         name: symbol_short!("yld_upd"),
         invoice_id: client.get_escrow().invoice_id,
         old_yield_bps: 600i64,
         new_yield_bps: 1_000i64,
-    }
-    .to_xdr(&env, &contract_id);
+    };
 
-    assert_eq!(all_events.events().last().unwrap().clone(), expected);
+    assert_eq!(decoded, expected);
+    assert_event_count(&env, &contract_id, symbol_short!("yld_upd"), 1);
 }
 
 // ── auth ordering guard ───────────────────────────────────────────────────────
@@ -3905,34 +3665,14 @@ fn setup_tiered_pool<'a>(
     Address,
 ) {
     env.mock_all_auths();
-    let token = install_stellar_asset_token(env);
-    let (contract_id, client) = deploy_with_id(env);
-    let admin = Address::generate(env);
-    let sme = Address::generate(env);
-    let treasury = Address::generate(env);
-
-    client.init(
-        &admin,
-        &String::from_str(env, invoice_id),
-        &sme,
-        &target,
-        &base_yield_bps,
-        &0u64,
-        &token.id,
-        &None,
-        &treasury,
-        &tiers,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-
-    );
-
+    let mut config = TestConfig::new()
+        .invoice_id(invoice_id)
+        .target(target)
+        .yield_bps(base_yield_bps);
+    if let Some(tiers) = tiers {
+        config = config.yield_tiers(tiers);
+    }
+    let (client, token, contract_id, treasury) = config.deploy_with_token(env);
     (client, token, contract_id, treasury)
 }
 
@@ -4047,6 +3787,8 @@ fn investor_payout_claimed_event_carries_payout_amount() {
 
     client.claim_investor_payout(&investor);
 
+    let decoded: crate::InvestorPayoutClaimed =
+        decode_contract_event(&env, &contract_id, symbol_short!("inv_claim"));
     let expected = crate::InvestorPayoutClaimed {
         name: symbol_short!("inv_claim"),
         investor: investor.clone(),
@@ -4054,12 +3796,11 @@ fn investor_payout_claimed_event_carries_payout_amount() {
         payout: pool,
         effective_yield_bps: 900,
         commitment_lock_secs: 100,
-    }
-    .to_xdr(&env, &contract_id);
+    };
 
     assert_eq!(
-        env.events().all().events().last().unwrap().clone(),
-        expected,
+        decoded, expected,
         "InvestorPayoutClaimed must include payout, effective yield, and commitment lock",
     );
+    assert_event_count(&env, &contract_id, symbol_short!("inv_claim"), 1);
 }

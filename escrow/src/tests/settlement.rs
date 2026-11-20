@@ -4023,6 +4023,260 @@ fn settlement_pool_unchanged_for_uniform_base_yield() {
     );
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// settle_batch — duplicate target semantics (issue #398)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Build a funded escrow (status == 1) backed by a real SAC, ready to settle.
+///
+/// Returns `(client, token, contract_id, sme)`.
+fn setup_batch_target<'a>(
+    env: &'a Env,
+    invoice_id: &str,
+) -> (
+    super::StarfundEscrowClient<'a>,
+    StellarTestToken<'a>,
+    Address,
+    Address,
+) {
+    let token = install_stellar_asset_token(env);
+    let (contract_id, client) = deploy_with_id(env);
+    let admin = Address::generate(env);
+    let sme = Address::generate(env);
+    let treasury = Address::generate(env);
+
+    client.init(
+        &admin,
+        &String::from_str(env, invoice_id),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &token.id,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    let investor = Address::generate(env);
+    token.stellar.mint(&investor, &TARGET);
+    client.fund(&investor, &TARGET);
+    assert_eq!(client.get_escrow().status, 1u32);
+
+    (client, token, contract_id, sme)
+}
+
+/// Count the `EscrowSettled` events emitted for `contract_id` in the current
+/// event buffer.
+fn count_escrow_settled_events(env: &Env, contract_id: &Address) -> u32 {
+    let mut count = 0u32;
+    for event in env.events().all().events() {
+        if event.0 == *contract_id {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// #398: a batch that repeats the same target settles it exactly once.
+///
+/// The batch is `[A, B, A]`. The first `A` settles, `B` settles, and the second
+/// `A` reports `FailedContract(EscrowAlreadySettled)` without emitting a second
+/// `EscrowSettled` event or moving `settled_at`.
+#[test]
+fn settle_batch_duplicate_target_settles_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_a, token_a, contract_a, sme_a) = setup_batch_target(&env, "DUP_A");
+    let (client_b, token_b, contract_b, sme_b) = setup_batch_target(&env, "DUP_B");
+
+    // Fund the settlement pools so both escrows can settle.
+    let pool_a = client_a.get_settlement_pool();
+    token_a.stellar.mint(&contract_a, &(pool_a - TARGET));
+    let pool_b = client_b.get_settlement_pool();
+    token_b.stellar.mint(&contract_b, &(pool_b - TARGET));
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut targets: SorobanVec<Address> = SorobanVec::new(&env);
+    targets.push_back(client_a.address.clone());
+    targets.push_back(client_b.address.clone());
+    targets.push_back(client_a.address.clone());
+
+    let results = client_a.settle_batch(&sme_a, &targets);
+    assert_eq!(results.len(), 3u32);
+
+    // First occurrence of A succeeds.
+    assert_eq!(results.get(0).unwrap(), SettlementBatchStatus::Settled);
+    // B succeeds.
+    assert_eq!(results.get(1).unwrap(), SettlementBatchStatus::Settled);
+    // Later occurrence of A reports the defined already-settled error.
+    assert_eq!(
+        results.get(2).unwrap(),
+        SettlementBatchStatus::FailedContract(EscrowError::EscrowAlreadySettled as u32),
+        "duplicate target must report EscrowAlreadySettled, not a global failure",
+    );
+
+    // Only one settlement is recorded for A: its timestamp is the batch timestamp
+    // and does not move when the duplicate is processed.
+    assert_eq!(client_a.get_settled_at(), Some(1_000));
+    assert_eq!(client_a.get_escrow().status, 2u32);
+    assert_eq!(client_b.get_escrow().status, 2u32);
+
+    // Exactly one EscrowSettled event per escrow — the duplicate emits none.
+    assert_eq!(
+        count_escrow_settled_events(&env, &contract_a),
+        1,
+        "duplicate target must not emit a second EscrowSettled event",
+    );
+    assert_eq!(count_escrow_settled_events(&env, &contract_b), 1);
+
+    // Advancing the ledger and re-running the duplicate must not change settled_at.
+    env.ledger().set_timestamp(5_000);
+    let mut dup_only: SorobanVec<Address> = SorobanVec::new(&env);
+    dup_only.push_back(client_a.address.clone());
+    let again = client_a.settle_batch(&sme_a, &dup_only);
+    assert_eq!(
+        again.get(0).unwrap(),
+        SettlementBatchStatus::FailedContract(EscrowError::EscrowAlreadySettled as u32),
+    );
+    assert_eq!(
+        client_a.get_settled_at(),
+        Some(1_000),
+        "settled_at must not change after a duplicate settlement attempt",
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// settle_batch — exact authorization trees (issue #399)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// #399: each batch target requires its own SME authorization.
+///
+/// Instead of `mock_all_auths`, this test installs an explicit auth tree per
+/// target: the SME authorizes the nested `settle` invocation on its escrow,
+/// which in turn authorizes the token transfer. One target's signer is omitted
+/// from the tree; only that target's outcome fails while the other authorized
+/// targets settle.
+#[test]
+fn settle_batch_requires_per_target_sme_auth() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    let env = Env::default();
+
+    let (client_a, token_a, contract_a, sme_a) = setup_batch_target(&env, "AUTH_A");
+    let (client_b, token_b, contract_b, sme_b) = setup_batch_target(&env, "AUTH_B");
+    let (client_c, token_c, contract_c, sme_c) = setup_batch_target(&env, "AUTH_C");
+
+    let pool_a = client_a.get_settlement_pool();
+    token_a.stellar.mint(&contract_a, &(pool_a - TARGET));
+    let pool_b = client_b.get_settlement_pool();
+    token_b.stellar.mint(&contract_b, &(pool_b - TARGET));
+    let pool_c = client_c.get_settlement_pool();
+    token_c.stellar.mint(&contract_c, &(pool_c - TARGET));
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut targets: SorobanVec<Address> = SorobanVec::new(&env);
+    targets.push_back(client_a.address.clone());
+    targets.push_back(client_b.address.clone());
+    targets.push_back(client_c.address.clone());
+
+    // The batch itself is authorized by the caller SME (sme_a).
+    let batch_invoke = MockAuthInvoke {
+        contract: &client_a.address,
+        fn_name: "settle_batch",
+        args: (sme_a.clone(), targets.clone()).into_val(&env),
+        sub_invokes: &[],
+    };
+
+    // Each target's SME authorizes the nested `settle` invocation on its escrow.
+    let settle_a = MockAuthInvoke {
+        contract: &client_a.address,
+        fn_name: "settle",
+        args: ().into_val(&env),
+        sub_invokes: &[],
+    };
+    let settle_b = MockAuthInvoke {
+        contract: &client_b.address,
+        fn_name: "settle",
+        args: ().into_val(&env),
+        sub_invokes: &[],
+    };
+    let settle_c = MockAuthInvoke {
+        contract: &client_c.address,
+        fn_name: "settle",
+        args: ().into_val(&env),
+        sub_invokes: &[],
+    };
+
+    // sme_b's authorization is deliberately omitted.
+    env.mock_auths(&[
+        MockAuth {
+            address: &sme_a,
+            invoke: &batch_invoke,
+        },
+        MockAuth {
+            address: &sme_a,
+            invoke: &settle_a,
+        },
+        MockAuth {
+            address: &sme_c,
+            invoke: &settle_c,
+        },
+    ]);
+
+    let results = client_a.settle_batch(&sme_a, &targets);
+    assert_eq!(results.len(), 3u32);
+
+    // Authorized targets settle.
+    assert_eq!(results.get(0).unwrap(), SettlementBatchStatus::Settled);
+    assert_eq!(results.get(2).unwrap(), SettlementBatchStatus::Settled);
+    assert_eq!(client_a.get_escrow().status, 2u32);
+    assert_eq!(client_c.get_escrow().status, 2u32);
+
+    // The target whose signer was omitted does not settle.
+    assert_ne!(
+        results.get(1).unwrap(),
+        SettlementBatchStatus::Settled,
+        "target without its SME authorization must not settle",
+    );
+    assert_eq!(
+        client_b.get_escrow().status, 1u32,
+        "unauthorized target must remain funded",
+    );
+
+    // Recorded nested auth invocations: only the authorized SMEs appear.
+    let auths = env.auths();
+    assert!(
+        auths.iter().any(|(addr, _)| *addr == sme_a),
+        "sme_a authorization must be recorded",
+    );
+    assert!(
+        auths.iter().any(|(addr, _)| *addr == sme_c),
+        "sme_c authorization must be recorded",
+    );
+    assert!(
+        !auths.iter().any(|(addr, _)| *addr == sme_b),
+        "sme_b authorization must not be recorded",
+    );
+
+    // Only the two authorized targets emitted a settlement event.
+    assert_eq!(count_escrow_settled_events(&env, &contract_a), 1);
+    assert_eq!(count_escrow_settled_events(&env, &contract_c), 1);
+    assert_eq!(count_escrow_settled_events(&env, &contract_b), 0);
+}
+
 /// #93: `InvestorPayoutClaimed` must carry the gross payout amount in its
 /// event payload so indexers do not need an external query.
 #[test]

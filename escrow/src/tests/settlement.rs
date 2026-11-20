@@ -234,6 +234,193 @@ fn withdraw_emits_event() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// `withdraw` — shared checked fee split (issue #386)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Set up a funded escrow with a non-zero protocol fee, backed by a real SAC.
+///
+/// Returns `(client, sme, treasury, sac_admin_client, contract_id)`.
+fn setup_funded_with_fee<'a>(
+    env: &'a Env,
+    fee_bps: i64,
+) -> (
+    super::StarfundEscrowClient<'a>,
+    Address,
+    Address,
+    StellarAssetClient<'a>,
+    Address,
+) {
+    env.mock_all_auths();
+    let sac = env.register_stellar_asset_contract_v2(Address::generate(env));
+    let token_id = sac.address();
+    let sac_admin = StellarAssetClient::new(env, &token_id);
+
+    let escrow_id = env.register(StarfundEscrow, ());
+    let client = super::StarfundEscrowClient::new(env, &escrow_id);
+    let admin = Address::generate(env);
+    let sme = Address::generate(env);
+    let treasury = Address::generate(env);
+
+    client.init(
+        &admin,
+        &soroban_sdk::String::from_str(env, "INV_FEE"),
+        &sme,
+        &TARGET,
+        &800i64,
+        &0u64,
+        &token_id,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None);
+
+    let investor = Address::generate(env);
+    sac_admin.mint(&investor, &TARGET);
+    client.fund(&investor, &TARGET);
+
+    (client, sme, treasury, sac_admin, escrow_id)
+}
+
+/// The shared fee split must satisfy `gross == fee + net` and route the fee to
+/// the treasury while the SME receives the net amount.
+#[test]
+fn withdraw_fee_split_gross_equals_fee_plus_net() {
+    let env = Env::default();
+    let fee_bps = 250i64; // 2.5%
+    let (client, sme, treasury, sac, contract_id) = setup_funded_with_fee(&env, fee_bps);
+
+    let gross = TARGET;
+    let expected_fee = gross * fee_bps as i128 / 10_000;
+    let expected_net = gross - expected_fee;
+
+    let sme_before = sac.balance(&sme);
+    let treasury_before = sac.balance(&treasury);
+    let escrow_before = sac.balance(&contract_id);
+
+    client.withdraw();
+
+    let sme_after = sac.balance(&sme);
+    let treasury_after = sac.balance(&treasury);
+    let escrow_after = sac.balance(&contract_id);
+
+    assert_eq!(
+        expected_fee + expected_net,
+        gross,
+        "gross must equal fee plus net"
+    );
+    assert_eq!(
+        sme_after - sme_before,
+        expected_net,
+        "SME must receive the net amount"
+    );
+    assert_eq!(
+        treasury_after - treasury_before,
+        expected_fee,
+        "treasury must receive the fee"
+    );
+    assert_eq!(
+        escrow_before - escrow_after,
+        gross,
+        "escrow balance must decrease by exactly the gross amount"
+    );
+    assert_eq!(
+        (sme_after - sme_before) + (treasury_after - treasury_before),
+        escrow_before - escrow_after,
+        "net + fee must equal the gross debited from escrow"
+    );
+}
+
+/// Zero fee rate: the whole gross goes to the SME and the treasury receives nothing.
+#[test]
+fn withdraw_zero_fee_routes_full_gross_to_sme() {
+    let env = Env::default();
+    let (client, sme, treasury, sac, contract_id) = setup_funded_with_fee(&env, 0i64);
+
+    let sme_before = sac.balance(&sme);
+    let treasury_before = sac.balance(&treasury);
+    let escrow_before = sac.balance(&contract_id);
+
+    client.withdraw();
+
+    assert_eq!(sac.balance(&sme) - sme_before, TARGET);
+    assert_eq!(sac.balance(&treasury), treasury_before);
+    assert_eq!(escrow_before - sac.balance(&contract_id), TARGET);
+}
+
+/// Fee rounding must floor (truncate) exactly as the previous inline arithmetic
+/// did, so the approved cumulative outcome from issue #224 is preserved.
+#[test]
+fn withdraw_fee_rounding_floors_like_previous_policy() {
+    let env = Env::default();
+    // 333 bps on TARGET (100_000_000_000) => 3_330_000_000 exactly; use an odd
+    // gross below to exercise truncation.
+    let (client, sme, treasury, sac, contract_id) = setup_funded_with_fee(&env, 333i64);
+
+    let gross = TARGET;
+    let numerator = gross * 333i128;
+    let expected_fee = numerator / 10_000; // floor
+    let expected_net = gross - expected_fee;
+
+    let sme_before = sac.balance(&sme);
+    let treasury_before = sac.balance(&treasury);
+
+    client.withdraw();
+
+    assert_eq!(
+        sac.balance(&treasury) - treasury_before,
+        expected_fee,
+        "fee must floor, not round up"
+    );
+    assert_eq!(
+        sac.balance(&sme) - sme_before,
+        expected_net,
+        "net must absorb the rounding remainder"
+    );
+    assert_eq!(expected_fee + expected_net, gross);
+    assert_eq!(
+        sac.balance(&contract_id),
+        0,
+        "escrow must be fully drained by the gross debit"
+    );
+}
+
+/// The `SmeWithdrew` event must report the fee and the net amount consistently
+/// with the token movements produced by the shared helper.
+#[test]
+fn withdraw_event_reports_fee_and_net_from_shared_helper() {
+    let env = Env::default();
+    let fee_bps = 500i64;
+    let (client, sme, _treasury, _sac, contract_id) = setup_funded_with_fee(&env, fee_bps);
+    let invoice_id = client.get_escrow().invoice_id.clone();
+
+    let expected_fee = TARGET * fee_bps as i128 / 10_000;
+    let expected_net = TARGET - expected_fee;
+
+    client.withdraw();
+
+    let events = env.events().all();
+    assert_eq!(
+        events.events().last().unwrap().clone(),
+        SmeWithdrew {
+            name: symbol_short!("sme_wd"),
+            invoice_id,
+            amount: expected_net,
+            recipient: sme,
+            fee: expected_fee,
+        }
+        .to_xdr(&env, &contract_id)
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // `withdraw` — wrong-status guards
 // ──────────────────────────────────────────────────────────────────────────────
 

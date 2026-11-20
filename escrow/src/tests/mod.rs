@@ -26,6 +26,7 @@ use super::{
     MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT, MAX_FUND_BATCH, RENT_WARN_LEDGERS,
     SCHEMA_VERSION,
 };
+use crate::fixtures::{DefaultMockToken, MockTokenRegistration};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events, Ledger as _},
@@ -95,20 +96,10 @@ pub fn free_addresses(env: &Env) -> (Address, Address) {
     (Address::generate(env), Address::generate(env))
 }
 
-pub struct StellarTestToken<'a> {
-    pub id: Address,
-    pub token: TokenClient<'a>,
-    pub stellar: StellarAssetClient<'a>,
-}
+pub use crate::fixtures::StellarTestToken;
 
 pub fn install_stellar_asset_token<'a>(env: &'a Env) -> StellarTestToken<'a> {
-    let sac = env.register_stellar_asset_contract_v2(Address::generate(env));
-    let id = sac.address();
-    StellarTestToken {
-        id: id.clone(),
-        token: TokenClient::new(env, &id),
-        stellar: StellarAssetClient::new(env, &id),
-    }
+    crate::fixtures::install_stellar_asset_token(env)
 }
 
 #[allow(dead_code)]

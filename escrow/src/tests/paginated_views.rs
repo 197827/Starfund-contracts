@@ -420,6 +420,12 @@ fn get_allowlisted_investors_excludes_revoked_addresses() {
 }
 
 // ── get_revoked_attestation_digests ───────────────────────────────────────────
+//
+// Attestation storage and mutation helpers now live in the private
+// `crate::attestation` module. The public entry points exercised here
+// (`append_attestation_digest`, `revoke_attestation_digests`,
+// `get_attestation_digests`, `get_revoked_attestation_digests`) are unchanged
+// wrappers, so these tests remain valid ABI-level regressions.
 
 fn setup_attestation_escrow(env: &Env) -> (crate::StarfundEscrowClient<'_>, Address) {
     let client = super::deploy(env);
@@ -516,7 +522,8 @@ fn get_revoked_attestation_digests_page_of_revoked_entries() {
         client.append_attestation_digest(&digest);
     }
 
-    // Revoke indices 1 and 3
+    // Revoke indices 1 and 3 (batch path shares index validation with the
+    // single-digest path inside the attestation module).
     client.revoke_attestation_digests(&soroban_sdk::vec![&env, 1u32, 3u32]);
 
     // Full scan from start=0
@@ -678,4 +685,28 @@ fn get_attestation_digests_and_revoked_enforce_same_limit_rules() {
         Err(Err(soroban_sdk::InvokeError::Contract(c))) => assert_eq!(c, zero_err),
         other => panic!("get_revoked_attestation_digests: expected Zero, got {other:?}"),
     }
+}
+
+/// After the attestation-module refactor, single and batch revoke operations
+/// must share index validation: an out-of-bounds index in a batch is rejected
+/// exactly as it would be for a single revoke, and the log is left unchanged.
+#[test]
+fn revoke_attestation_digests_batch_shares_index_validation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup_attestation_escrow(&env);
+
+    // Append 2 digests → valid indices are 0 and 1.
+    for seed in 0u8..2 {
+        let digest = soroban_sdk::BytesN::from_array(&env, &[seed; 32]);
+        client.append_attestation_digest(&digest);
+    }
+
+    // Batch containing an out-of-bounds index must fail.
+    let result = client.try_revoke_attestation_digests(&soroban_sdk::vec![&env, 0u32, 5u32]);
+    assert!(result.is_err(), "out-of-bounds batch index must be rejected");
+
+    // No entries should have been revoked by the failed batch.
+    let revoked = client.get_revoked_attestation_digests(&0, &10);
+    assert_eq!(revoked.len(), 0);
 }

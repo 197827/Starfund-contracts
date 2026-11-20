@@ -156,7 +156,16 @@ use soroban_sdk::{
 };
 
 pub mod external_calls;
+mod attestation;
+mod callback;
+mod fees;
 mod keys;
+
+#[cfg(any(test, feature = "testutils"))]
+mod fixtures;
+
+#[cfg(any(test, feature = "testutils"))]
+pub use fixtures::{DefaultMockToken, MOCK_TOKEN_DEFAULT_BALANCE};
 
 /// Compatibility defaults for older allowlist-limit tests and admin helpers.
 pub const DEFAULT_ALLOWLIST_LIMIT: u32 = 100;
@@ -10446,57 +10455,10 @@ impl StarfundEscrow {
     ///
     /// # Returns
     /// The allocated unique invocation nonce (`u64`).
+    ///
+    /// Implementation lives in [`crate::callback`] (issue #388).
     pub fn register_callback(env: Env, origin: Address, phase: u32) -> u64 {
-        let escrow = Self::load_escrow_require_admin(&env);
-
-        ensure(
-            &env,
-            escrow.status == 0 || escrow.status == 1,
-            EscrowError::CallbackOnTerminalEscrow,
-        );
-
-        let current_nonce: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CallbackNonce)
-            .unwrap_or(0);
-        let next_nonce = current_nonce
-            .checked_add(1)
-            .unwrap_or_else(|| fail(&env, EscrowError::FundedAmountOverflow));
-
-        let mut pending_callbacks = Self::pending_callback_nonces(&env);
-        pending_callbacks.push_back(next_nonce);
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingCallbackNonces, &pending_callbacks);
-
-        env.storage()
-            .instance()
-            .set(&DataKey::CallbackNonce, &next_nonce);
-
-        let now = env.ledger().timestamp();
-        let context = CallbackContext {
-            origin: origin.clone(),
-            nonce: next_nonce,
-            phase,
-            created_at: now,
-            consumed: false,
-        };
-
-        env.storage()
-            .instance()
-            .set(&DataKey::CallbackContext(next_nonce), &context);
-
-        CallbackRegisteredEvent {
-            name: symbol_short!("cb_reg"),
-            invoice_id: escrow.invoice_id,
-            origin,
-            nonce: next_nonce,
-            phase,
-        }
-        .publish(&env);
-
-        next_nonce
+        crate::callback::register_callback(&env, origin, phase)
     }
 
     /// Execute and consume a registered cross-contract callback.
@@ -10525,128 +10487,28 @@ impl StarfundEscrow {
     ///
     /// # Returns
     /// The updated [`CallbackContext`] snapshot with `consumed == true`.
+    ///
+    /// Implementation lives in [`crate::callback`] (issue #388).
     pub fn execute_callback(env: Env, nonce: u64, origin: Address, phase: u32) -> CallbackContext {
-        let escrow = Self::get_escrow(env.clone());
-
-        ensure(
-            &env,
-            escrow.status != 4,
-            EscrowError::CallbackAfterCancellation,
-        );
-
-        origin.require_auth();
-
-        let mut context: CallbackContext = env
-            .storage()
-            .instance()
-            .get(&DataKey::CallbackContext(nonce))
-            .unwrap_or_else(|| fail(&env, EscrowError::CallbackNotFound));
-
-        ensure(&env, !context.consumed, EscrowError::CallbackReplayed);
-
-        ensure(
-            &env,
-            context.origin == origin,
-            EscrowError::CallbackWrongOrigin,
-        );
-
-        ensure(
-            &env,
-            context.nonce == nonce,
-            EscrowError::CallbackWrongNonce,
-        );
-
-        ensure(
-            &env,
-            context.phase == phase,
-            EscrowError::CallbackWrongPhase,
-        );
-
-        context.consumed = true;
-        env.storage()
-            .instance()
-            .set(&DataKey::CallbackContext(nonce), &context);
-        Self::remove_pending_callback_nonce(&env, nonce);
-
-        CallbackExecutedEvent {
-            name: symbol_short!("cb_exec"),
-            invoice_id: escrow.invoice_id,
-            origin,
-            nonce,
-            phase,
-        }
-        .publish(&env);
-
-        context
+        crate::callback::execute_callback(&env, nonce, origin, phase)
     }
 
     /// Read-only view returning the registered callback context for a given invocation `nonce`.
     /// Returns `None` if no callback was registered with this nonce.
     pub fn get_callback(env: Env, nonce: u64) -> Option<CallbackContext> {
-        env.storage()
-            .instance()
-            .get(&DataKey::CallbackContext(nonce))
+        crate::callback::get_callback(&env, nonce)
     }
 
     /// Read-only view returning the current callback invocation nonce counter.
     /// Returns `0` if no callbacks have been registered.
     pub fn get_callback_nonce(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::CallbackNonce)
-            .unwrap_or(0)
+        crate::callback::get_callback_nonce(&env)
     }
 
     /// Read-only view returning whether the callback for `nonce` has been consumed.
     /// Returns `false` if the callback is unconsumed or does not exist.
     pub fn is_callback_consumed(env: Env, nonce: u64) -> bool {
-        let context: Option<CallbackContext> = env
-            .storage()
-            .instance()
-            .get(&DataKey::CallbackContext(nonce));
-        context.map(|c| c.consumed).unwrap_or(false)
-    }
-
-    fn pending_callback_nonces(env: &Env) -> Vec<u64> {
-        if let Some(pending) = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingCallbackNonces)
-        {
-            return pending;
-        }
-
-        let mut pending = Vec::new(env);
-        let last_nonce: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CallbackNonce)
-            .unwrap_or(0);
-        for nonce in 1..=last_nonce {
-            let context: Option<CallbackContext> = env
-                .storage()
-                .instance()
-                .get(&DataKey::CallbackContext(nonce));
-            if context.map(|context| !context.consumed).unwrap_or(false) {
-                pending.push_back(nonce);
-            }
-        }
-        pending
-    }
-
-    fn remove_pending_callback_nonce(env: &Env, nonce: u64) {
-        let mut pending = Self::pending_callback_nonces(env);
-        let mut index = 0;
-        while index < pending.len() {
-            if pending.get(index) == Some(nonce) {
-                pending.remove(index);
-                break;
-            }
-            index += 1;
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingCallbackNonces, &pending);
+        crate::callback::is_callback_consumed(&env, nonce)
     }
 }
 
@@ -10786,67 +10648,7 @@ mod init_reentry_guard_tests {
 // #[cfg(test)]
 // mod release_budget_tests;
 
-/// Default starting balance assigned to any address that has never been seen by the
-/// [`DefaultMockToken`] contract.
-///
-/// The value (100 trillion stroops, i.e. 10 000 000 XLM at 7 decimal places) is large
-/// enough that ordinary test escrow amounts never accidentally overdraw an account,
-/// while still being representable in a signed 64-bit integer.  Defined once here so
-/// that `balance` and `transfer` stay in sync and a single edit suffices to change the
-/// test-harness funding level.  Large-principal tests that fund above this ceiling must
-/// provision balances via a real Stellar asset token (see `install_stellar_asset_token`).
-#[cfg(any(test, feature = "testutils"))]
-pub const MOCK_TOKEN_DEFAULT_BALANCE: i128 = 100_000_000_000_000i128;
-
-#[cfg(any(test, feature = "testutils"))]
-#[soroban_sdk::contract]
-pub struct DefaultMockToken;
-
-#[cfg(any(test, feature = "testutils"))]
-#[soroban_sdk::contractimpl]
-impl DefaultMockToken {
-    pub fn balance(env: soroban_sdk::Env, addr: soroban_sdk::Address) -> i128 {
-        let key = soroban_sdk::symbol_short!("balances");
-        let mut balances: soroban_sdk::Map<soroban_sdk::Address, i128> = env
-            .storage()
-            .instance()
-            .get(&key)
-            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
-        balances.get(addr).unwrap_or(100_000_000_000_000i128)
-    }
-
-    pub fn transfer(
-        env: soroban_sdk::Env,
-        from: soroban_sdk::Address,
-        to: soroban_sdk::Address,
-        amount: i128,
-    ) {
-        let key = soroban_sdk::symbol_short!("balances");
-        let mut balances: soroban_sdk::Map<soroban_sdk::Address, i128> = env
-            .storage()
-            .instance()
-            .get(&key)
-            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
-        let from_bal = balances
-            .get(from.clone())
-            .unwrap_or(100_000_000_000_000i128);
-        let to_bal = balances.get(to.clone()).unwrap_or(100_000_000_000_000i128);
-        balances.set(from.clone(), from_bal - amount);
-        balances.set(to.clone(), to_bal + amount);
-        env.storage().instance().set(&key, &balances);
-    }
-}
-
-#[cfg(any(test, feature = "testutils"))]
-fn register_mock_token_if_needed(env: &Env, token_addr: &Address) {
-    use std::panic::AssertUnwindSafe;
-    let env_clone = env.clone();
-    let token_clone = token_addr.clone();
-    let result = std::panic::catch_unwind(AssertUnwindSafe(move || {
-        let client = TokenClient::new(&env_clone, &token_clone);
-        let _ = client.balance(&token_clone);
-    }));
-    if result.is_err() {
-        env.register_at(token_addr, DefaultMockToken, ());
-    }
-}
+// Native token fixtures (`DefaultMockToken`, `MOCK_TOKEN_DEFAULT_BALANCE`, and the
+// registration scaffolding) now live in `escrow/src/fixtures.rs` behind an explicit
+// `cfg(any(test, feature = "testutils"))` boundary so production WASM excludes them.
+// See issue #387.

@@ -4023,6 +4023,163 @@ fn settlement_pool_unchanged_for_uniform_base_yield() {
     );
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// `settle_batch` — outcome classification for incompatible targets (issue #397)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Fixture contract with no `settle` entrypoint at all.
+///
+/// Invoking `settle` on it exercises the host's "missing method" path rather
+/// than a typed escrow error.
+#[soroban_sdk::contract]
+pub struct NoSettleTarget;
+
+#[soroban_sdk::contractimpl]
+impl NoSettleTarget {
+    /// Present so the contract has at least one exported entrypoint.
+    pub fn ping(_env: Env) -> u32 {
+        1
+    }
+}
+
+/// Fixture contract whose `settle` returns a malformed (non-`SettlementResult`)
+/// value, exercising the host's return-value decoding failure path.
+#[soroban_sdk::contract]
+pub struct MalformedSettleTarget;
+
+#[soroban_sdk::contractimpl]
+impl MalformedSettleTarget {
+    /// Returns a `u32` where `settle_batch` expects a `SettlementResult`.
+    pub fn settle(_env: Env) -> u32 {
+        42
+    }
+}
+
+/// Fixture contract whose `settle` deliberately traps, exercising the host's
+/// invocation-failure path.
+#[soroban_sdk::contract]
+pub struct TrappingSettleTarget;
+
+#[soroban_sdk::contractimpl]
+impl TrappingSettleTarget {
+    pub fn settle(env: Env) -> SettlementResult {
+        // Deliberate host failure: panic inside the callee.
+        env.panic_with_error(soroban_sdk::xdr::ScErrorType::Context, 0u32);
+        unreachable!()
+    }
+}
+
+/// `settle_batch` must classify every incompatible target as
+/// [`SettlementBatchStatus::FailedInvocation`], preserve the input order and
+/// addresses in the outcome vector, and still settle a valid escrow in the
+/// same batch.
+#[test]
+fn settle_batch_classifies_incompatible_targets_as_failed_invocation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Valid, funded escrow that must settle successfully.
+    let (valid_client, _token, valid_id, _treasury) =
+        setup_claim_env(&env, "BATCH_OK", 1_000i128, 400i64);
+    let investor = Address::generate(&env);
+    valid_client.fund(&investor, &1_000i128);
+
+    // Incompatible targets.
+    let no_settle_id = env.register(NoSettleTarget, ());
+    let malformed_id = env.register(MalformedSettleTarget, ());
+    let trapping_id = env.register(TrappingSettleTarget, ());
+
+    let targets = SorobanVec::from_array(
+        &env,
+        [
+            no_settle_id.clone(),
+            valid_id.clone(),
+            malformed_id.clone(),
+            trapping_id.clone(),
+        ],
+    );
+
+    let outcomes = valid_client.settle_batch(&targets);
+
+    assert_eq!(
+        outcomes.len(),
+        targets.len(),
+        "one outcome per input target"
+    );
+
+    // Addresses and order must mirror the input vector exactly.
+    for i in 0..targets.len() {
+        assert_eq!(
+            outcomes.get(i).unwrap().target,
+            targets.get(i).unwrap(),
+            "outcome address at index {i} must match the input target",
+        );
+    }
+
+    assert_eq!(
+        outcomes.get(0).unwrap().status,
+        SettlementBatchStatus::FailedInvocation,
+        "target without a settle method must report FailedInvocation",
+    );
+    assert_eq!(
+        outcomes.get(1).unwrap().status,
+        SettlementBatchStatus::Settled,
+        "valid funded escrow must report Settled",
+    );
+    assert_eq!(
+        outcomes.get(2).unwrap().status,
+        SettlementBatchStatus::FailedInvocation,
+        "target returning a malformed value must report FailedInvocation",
+    );
+    assert_eq!(
+        outcomes.get(3).unwrap().status,
+        SettlementBatchStatus::FailedInvocation,
+        "target that traps must report FailedInvocation",
+    );
+
+    // The valid escrow really settled.
+    assert_eq!(valid_client.get_escrow().status, 2u32);
+}
+
+/// A later valid target in the batch must still succeed after earlier
+/// incompatible targets have failed.
+#[test]
+fn settle_batch_valid_target_after_failures_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (valid_client, _token, valid_id, _treasury) =
+        setup_claim_env(&env, "BATCH_LATE", 1_000i128, 400i64);
+    let investor = Address::generate(&env);
+    valid_client.fund(&investor, &1_000i128);
+
+    let no_settle_id = env.register(NoSettleTarget, ());
+    let trapping_id = env.register(TrappingSettleTarget, ());
+
+    let targets = SorobanVec::from_array(
+        &env,
+        [no_settle_id, trapping_id, valid_id.clone()],
+    );
+
+    let outcomes = valid_client.settle_batch(&targets);
+
+    assert_eq!(
+        outcomes.get(0).unwrap().status,
+        SettlementBatchStatus::FailedInvocation
+    );
+    assert_eq!(
+        outcomes.get(1).unwrap().status,
+        SettlementBatchStatus::FailedInvocation
+    );
+    assert_eq!(outcomes.get(2).unwrap().target, valid_id);
+    assert_eq!(
+        outcomes.get(2).unwrap().status,
+        SettlementBatchStatus::Settled,
+        "a valid target after failures must still settle",
+    );
+    assert_eq!(valid_client.get_escrow().status, 2u32);
+}
+
 /// #93: `InvestorPayoutClaimed` must carry the gross payout amount in its
 /// event payload so indexers do not need an external query.
 #[test]

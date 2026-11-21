@@ -15,9 +15,10 @@ use soroban_sdk::{
     Address, Env, IntoVal, String, Symbol, TryIntoVal,
 };
 
+use crate::callback::CallbackContext;
 use crate::tests::assert_contract_error;
 
-use super::{CallbackContext, EscrowError, StarfundEscrow, StarfundEscrowClient};
+use super::{EscrowError, StarfundEscrow, StarfundEscrowClient};
 
 /// Deploy and initialize an escrow instance for callback testing.
 fn deploy_escrow<'a>(
@@ -169,7 +170,7 @@ fn test_callback_stored_nonce_mismatch_rejected() {
     env.as_contract(&id, || {
         env.storage()
             .instance()
-            .set(&super::DataKey::CallbackContext(nonce), &context);
+            .set(&crate::callback::DataKey::CallbackContext(nonce), &context);
     });
 
     assert_contract_error(

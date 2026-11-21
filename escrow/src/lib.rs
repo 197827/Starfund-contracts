@@ -10565,6 +10565,34 @@ impl StarfundEscrow {
         crate::callback::get_callback(&env, nonce)
     }
 
+    /// Diagnostic classification of an investor's claim marker
+    /// (`DataKey::InvestorClaimed`) for operator runbooks.
+    ///
+    /// A fresh investor without a claim marker is reported as
+    /// [`InvestorKeyState::AbsentOptional`] — never as proven expired. When the
+    /// key is absent but archival state cannot be confirmed from ledger evidence
+    /// the result is [`InvestorKeyState::UnknownArchival`]. Only when the caller
+    /// supplies ledger evidence (`archival_confirmed = true`) is the key reported
+    /// as [`InvestorKeyState::ConfirmedExpired`].
+    ///
+    /// This is a pure read: no authorization, no storage writes.
+    pub fn classify_investor_claim_key(
+        env: Env,
+        investor: Address,
+        archival_confirmed: bool,
+    ) -> InvestorKeyState {
+        let key = DataKey::InvestorClaimed(investor);
+        if env.storage().persistent().has(&key) {
+            // Present: the key exists, so it is neither absent nor expired.
+            return InvestorKeyState::AbsentOptional;
+        }
+        if archival_confirmed {
+            InvestorKeyState::ConfirmedExpired
+        } else {
+            InvestorKeyState::UnknownArchival
+        }
+    }
+
     /// Read-only view returning the current callback invocation nonce counter.
     /// Returns `0` if no callbacks have been registered.
     pub fn get_callback_nonce(env: Env) -> u64 {
@@ -10576,6 +10604,38 @@ impl StarfundEscrow {
     pub fn is_callback_consumed(env: Env, nonce: u64) -> bool {
         crate::callback::is_callback_consumed(&env, nonce)
     }
+}
+
+/// Maximum number of simultaneously pending (unconsumed) callback registrations.
+///
+/// `register_callback` rejects a new registration once this many callbacks are
+/// outstanding, keeping instance storage and removal scans bounded. Consuming a
+/// callback via `execute_callback` frees a slot.
+pub const MAX_PENDING_CALLBACKS: u32 = 64;
+
+/// Maximum number of historical nonces inspected per reconstruction call when
+/// rebuilding a missing pending-callback index (see `pending_callback_nonces`).
+pub const CALLBACK_RECONSTRUCTION_BATCH: u32 = 32;
+
+/// Maximum page size accepted by `get_pending_callbacks`.
+pub const MAX_CALLBACK_PAGE_LIMIT: u32 = 50;
+
+/// Classification of an investor storage key for operator diagnostics.
+///
+/// Distinguishes a key that was **never created** (optional key absence) from a
+/// key whose archival state cannot be confirmed from ledger evidence, and from a
+/// key that is **proven** expired by ledger evidence.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvestorKeyState {
+    /// The key was never written for this investor (e.g. no claim marker yet).
+    /// This is **not** evidence of expiry.
+    AbsentOptional,
+    /// The key is absent but the ledger cannot confirm whether it was archived.
+    /// Operators must gather ledger evidence before treating it as expired.
+    UnknownArchival,
+    /// The key is absent **and** ledger evidence confirms archival/expiry.
+    ConfirmedExpired,
 }
 
 /// Read-only reconciliation snapshot returned by
@@ -10694,6 +10754,220 @@ mod init_reentry_guard_tests {
                 .set(&DataKey::Version, &SCHEMA_VERSION);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 ensure_not_initialized(&env);
+            }));
+            assert!(result.is_err());
+        });
+    }
+}
+
+#[cfg(test)]
+mod callback_diagnostics_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn with_contract<R>(env: &Env, f: impl FnOnce(&Address) -> R) -> R {
+        let contract_id = env.register(StarfundEscrow, ());
+        env.as_contract(&contract_id, || f(&contract_id))
+    }
+
+    fn seed_context(env: &Env, nonce: u64, consumed: bool) {
+        let context = CallbackContext {
+            origin: Address::generate(env),
+            nonce,
+            phase: 0,
+            created_at: 0,
+            consumed,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::CallbackContext(nonce), &context);
+    }
+
+    #[test]
+    fn fresh_investor_is_not_proven_expired() {
+        let env = Env::default();
+        with_contract(&env, |_| {
+            let investor = Address::generate(&env);
+            let state = StarfundEscrow::classify_investor_claim_key(
+                env.clone(),
+                investor,
+                false,
+            );
+            assert_eq!(state, InvestorKeyState::UnknownArchival);
+        });
+    }
+
+    #[test]
+    fn exited_investor_key_present() {
+        let env = Env::default();
+        with_contract(&env, |_| {
+            let investor = Address::generate(&env);
+            env.storage()
+                .persistent()
+                .set(&DataKey::InvestorClaimed(investor.clone()), &true);
+            let state = StarfundEscrow::classify_investor_claim_key(
+                env.clone(),
+                investor,
+                false,
+            );
+            assert_eq!(state, InvestorKeyState::AbsentOptional);
+        });
+    }
+
+    #[test]
+    fn archived_key_requires_ledger_evidence() {
+        let env = Env::default();
+        with_contract(&env, |_| {
+            let investor = Address::generate(&env);
+            let state = StarfundEscrow::classify_investor_claim_key(
+                env.clone(),
+                investor,
+                true,
+            );
+            assert_eq!(state, InvestorKeyState::ConfirmedExpired);
+        });
+    }
+
+    #[test]
+    fn exact_max_pending_succeeds_and_one_more_fails() {
+        let env = Env::default();
+        with_contract(&env, |_| {
+            let mut pending = Vec::new(&env);
+            for nonce in 1..=MAX_PENDING_CALLBACKS as u64 {
+                pending.push_back(nonce);
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::PendingCallbackNonces, &pending);
+            env.storage()
+                .instance()
+                .set(&DataKey::CallbackNonce, &(MAX_PENDING_CALLBACKS as u64));
+
+            // At the ceiling: one more registration must fail atomically.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut p = StarfundEscrow::pending_callback_nonces(&env);
+                ensure(
+                    &env,
+                    p.len() < MAX_PENDING_CALLBACKS,
+                    EscrowError::TooManyPendingCallbacks,
+                );
+                p.push_back(999);
+            }));
+            assert!(result.is_err());
+            let stored: Vec<u64> = env
+                .storage()
+                .instance()
+                .get(&DataKey::PendingCallbackNonces)
+                .unwrap();
+            assert_eq!(stored.len(), MAX_PENDING_CALLBACKS);
+        });
+    }
+
+    #[test]
+    fn consuming_frees_a_slot() {
+        let env = Env::default();
+        with_contract(&env, |_| {
+            let mut pending = Vec::new(&env);
+            for nonce in 1..=MAX_PENDING_CALLBACKS as u64 {
+                pending.push_back(nonce);
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::PendingCallbackNonces, &pending);
+            StarfundEscrow::remove_pending_callback_nonce(&env, 1);
+            let stored: Vec<u64> = env
+                .storage()
+                .instance()
+                .get(&DataKey::PendingCallbackNonces)
+                .unwrap();
+            assert_eq!(stored.len(), MAX_PENDING_CALLBACKS - 1);
+        });
+    }
+
+    #[test]
+    fn sparse_high_nonce_reconstruction_is_bounded() {
+        let env = Env::default();
+        with_contract(&env, |_| {
+            let high: u64 = 1000;
+            env.storage()
+                .instance()
+                .set(&DataKey::CallbackNonce, &high);
+            seed_context(&env, 5, false);
+            seed_context(&env, 900, false);
+            seed_context(&env, 7, true);
+
+            // First call scans at most CALLBACK_RECONSTRUCTION_BATCH nonces.
+            let first = StarfundEscrow::pending_callback_nonces(&env);
+            assert!(first.len() <= CALLBACK_RECONSTRUCTION_BATCH);
+            let cursor: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::CallbackReconstructCursor)
+                .unwrap();
+            assert_eq!(cursor, CALLBACK_RECONSTRUCTION_BATCH as u64);
+
+            // Drive reconstruction to completion.
+            let mut all = first;
+            let mut guard = 0;
+            while !env.storage().instance().has(&DataKey::PendingCallbackNonces) {
+                all = StarfundEscrow::pending_callback_nonces(&env);
+                guard += 1;
+                assert!(guard < 100);
+            }
+            assert_eq!(all.len(), 2);
+            assert!(all.contains(5));
+            assert!(all.contains(900));
+        });
+    }
+
+    #[test]
+    fn pagination_concatenates_with_gaps() {
+        let env = Env::default();
+        with_contract(&env, |_| {
+            let mut pending = Vec::new(&env);
+            for nonce in [2u64, 4, 6, 8] {
+                pending.push_back(nonce);
+                seed_context(&env, nonce, false);
+            }
+            // Consumed context inside the index must be skipped.
+            pending.push_back(5);
+            seed_context(&env, 5, true);
+            env.storage()
+                .instance()
+                .set(&DataKey::PendingCallbackNonces, &pending);
+
+            let page1 = StarfundEscrow::get_pending_callbacks(env.clone(), 0, 2);
+            let page2 = StarfundEscrow::get_pending_callbacks(env.clone(), 2, 2);
+            let page3 = StarfundEscrow::get_pending_callbacks(env.clone(), 4, 2);
+            assert_eq!(page1.len(), 2);
+            assert_eq!(page2.len(), 2);
+            assert_eq!(page3.len(), 1);
+            let mut nonces = Vec::new(&env);
+            for c in page1.iter().chain(page2.iter()).chain(page3.iter()) {
+                nonces.push_back(c.nonce);
+            }
+            assert_eq!(nonces.len(), 4);
+            assert!(nonces.contains(2));
+            assert!(nonces.contains(4));
+            assert!(nonces.contains(6));
+            assert!(nonces.contains(8));
+        });
+    }
+
+    #[test]
+    fn pagination_limit_enforced() {
+        let env = Env::default();
+        with_contract(&env, |_| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                StarfundEscrow::get_pending_callbacks(env.clone(), 0, 0);
+            }));
+            assert!(result.is_err());
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                StarfundEscrow::get_pending_callbacks(
+                    env.clone(),
+                    0,
+                    MAX_CALLBACK_PAGE_LIMIT + 1,
+                );
             }));
             assert!(result.is_err());
         });

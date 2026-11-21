@@ -26,6 +26,7 @@ use super::{
     MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT, MAX_FUND_BATCH, RENT_WARN_LEDGERS,
     SCHEMA_VERSION,
 };
+use crate::fixtures::{DefaultMockToken, MockTokenRegistration};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events, Ledger as _},
@@ -36,24 +37,11 @@ use std::fmt::Debug;
 
 pub use soroban_sdk::Symbol;
 
-pub(crate) fn assert_contract_error<T, E>(
-    result: Result<Result<T, E>, Result<Error, InvokeError>>,
-    expected: EscrowError,
-) where
-    T: Debug,
-    E: Debug,
-{
-    let expected_code = expected as u32;
-    match result {
-        Err(Ok(error)) => {
-            assert_eq!(error, Error::from_contract_error(expected_code));
-        }
-        Err(Err(InvokeError::Contract(code))) => {
-            assert_eq!(code, expected_code);
-        }
-        other => panic!("expected ContractError({expected_code}), got {other:?}"),
-    }
-}
+mod test_utils;
+
+pub use test_utils::{
+    assert_contract_error, decode_event, find_event, find_events, TestConfig,
+};
 
 // Focused test tree for escrow behavior. Shared helpers live here so feature
 // modules stay assertion-focused and each test still owns a fresh Env.
@@ -95,45 +83,18 @@ pub fn free_addresses(env: &Env) -> (Address, Address) {
     (Address::generate(env), Address::generate(env))
 }
 
-pub struct StellarTestToken<'a> {
-    pub id: Address,
-    pub token: TokenClient<'a>,
-    pub stellar: StellarAssetClient<'a>,
-}
+pub use crate::fixtures::StellarTestToken;
 
 pub fn install_stellar_asset_token<'a>(env: &'a Env) -> StellarTestToken<'a> {
-    let sac = env.register_stellar_asset_contract_v2(Address::generate(env));
-    let id = sac.address();
-    StellarTestToken {
-        id: id.clone(),
-        token: TokenClient::new(env, &id),
-        stellar: StellarAssetClient::new(env, &id),
-    }
+    crate::fixtures::install_stellar_asset_token(env)
 }
 
 #[allow(dead_code)]
 pub fn default_init(client: &StarfundEscrowClient<'_>, env: &Env, admin: &Address, sme: &Address) {
-    let (token, treasury) = free_addresses(env);
-    client.init(
-        admin,
-        &soroban_sdk::String::from_str(env, "INV001"),
-        sme,
-        &100_000_000_000i128,
-        &800i64,
-        &0u64,
-        &token,
-        &None,
-        &treasury,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None,
-        &None, // No funding deadline
-        &None,
-        &None,
-        &None,
-        &None);
+    TestConfig::new(env)
+        .with_admin(admin.clone())
+        .with_sme(sme.clone())
+        .init(client);
 }
 
 #[allow(dead_code)]

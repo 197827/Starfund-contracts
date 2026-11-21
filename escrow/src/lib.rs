@@ -3,7 +3,7 @@
 //!
 //! Holds investor funds for an invoice until settlement.
 //! - SME receives stablecoin when funding target is met ([`StarfundEscrow::withdraw`])
-//! - SME records optional **collateral commitments** ([`StarfundEscrow::record_sme_collateral_commitment`]) ΓÇö
+//! - SME records optional **collateral commitments** ([`StarfundEscrow::record_sme_collateral_commitment`]) --
 //!   these are **ledger records only**; they do **not** move tokens, freeze balances,
 //!   reserve assets, or create an enforceable on-chain claim.
 //! - [`StarfundEscrow::settle`] finalizes the escrow after maturity (when configured).
@@ -13,7 +13,7 @@
 //! The constant [`SCHEMA_VERSION`] is written to [`DataKey::Version`] by [`StarfundEscrow::init`]
 //! and is the canonical source of truth for upgrade decisions. **Current value: 6.**
 //!
-//! [`StarfundEscrow::migrate`] **fails with typed errors in all current execution paths** ΓÇö no
+//! [`StarfundEscrow::migrate`] **fails with typed errors in all current execution paths** -- no
 //! silent migration work is promised or performed. Operators must extend `migrate` before calling
 //! it, or redeploy when stored struct layout changes. See `docs/OPERATOR_RUNBOOK.md` for the full
 //! decision tree.
@@ -58,14 +58,14 @@
 //! ## Authorization guard ordering
 //!
 //! Every state-mutating entrypoint follows a canonical sequence (see
-//! `docs/escrow-security-checklist.md` ┬º6 and [ADR-002](docs/adr/ADR-002-auth-boundaries.md)):
+//! `docs/escrow-security-checklist.md` section 6 and [ADR-002](docs/adr/ADR-002-auth-boundaries.md)):
 //!
 //! 1. **Read-only** preconditions (legal hold, status checks, input validation).
 //! 2. **`Address::require_auth()`** for the bound role ([Stellar authorization](https://developers.stellar.org/docs/build/guides/auth/contract-authorization)).
 //! 3. **Storage writes** and **SEP-41 transfers** (via [`external_calls`]).
 //!
 //! Invariant: no instance/persistent storage mutation and no token transfer occurs until
-//! step 2 succeeds. Reading [`DataKey::Escrow`] before `require_auth` is intentional ΓÇö it is
+//! step 2 succeeds. Reading [`DataKey::Escrow`] before `require_auth` is intentional -- it is
 //! read-only and does not weaken the auth boundary.
 //!
 //! ## Invoice identifier (`invoice_id`)
@@ -79,9 +79,40 @@
 //!
 //! Each escrow instance binds exactly one **funding token** contract ([`DataKey::FundingToken`])
 //! at [`StarfundEscrow::init`]; it cannot be changed after deploy. An optional **registry**
-//! ([`DataKey::RegistryRef`]) is a read-only discoverability hint only ΓÇö it is **not** an authority
+//! ([`DataKey::RegistryRef`]) is a read-only discoverability hint only -- it is **not** an authority
 //! for this contract and must not be used on-chain as proof of registry state without calling the
 //! registry yourself.
+//!
+//! ### Funding token decimal metadata failures at `init`
+//!
+//! [`StarfundEscrow::init`] reads the funding token's SEP-41 `decimals()` metadata to pin the
+//! token's decimal scale. That read is a live cross-contract call, so a token that does not
+//! implement the SEP-41 metadata ABI can fail in several ways:
+//!
+//! - **Missing `decimals`** ΓÇö the token has no `decimals` entrypoint (host reports a missing
+//!   function / unknown method).
+//! - **Wrong return type** ΓÇö `decimals` exists but does not return a `u32` (ABI mismatch).
+//! - **Contract error** ΓÇö the token traps or returns a contract error from `decimals`.
+//!
+//! **Public failure behavior:** in every case the `init` invocation fails (traps) and **no
+//! escrow state is persisted** ΓÇö [`DataKey::Escrow`], [`DataKey::Version`], the funding token,
+//! and all other init-written keys remain unset, and no lifecycle event is emitted. The failure
+//! surfaces as the host's cross-contract-call error (missing entrypoint / conversion failure /
+//! token error), **not** as a guaranteed [`EscrowError`] code: this contract does not wrap the
+//! metadata read in a typed error, so integrators must not branch on an invented code. Callers
+//! should treat any `init` failure as "not initialized" and retry with a SEP-41-compliant token.
+//! See `decimal_scale_tests` for the registered fixtures covering each failure mode.
+//!
+//! ## Investor index ceiling (supported configuration)
+//!
+//! [`DataKey::InvestorIndex`] is a single instance-storage `Vec<Address>`. [`StarfundEscrow::init`]
+//! rejects a configured `max_unique_investors` above [`SUPPORTED_MAX_UNIQUE_INVESTORS`] with
+//! [`EscrowError::MaxUniqueInvestorsExceedsSupported`] before persisting anything; the
+//! unconditional [`MAX_UNIQUE_INVESTORS`] hard cap still bounds funding for every escrow. Escrows
+//! initialized before this check may hold a larger stored cap: they are not migrated, remain
+//! readable, and may fail on the first index append that exceeds instance-storage limits ΓÇö treat
+//! that as the effective ceiling and redeploy. A paged `InvestorIndex` (like the allowlist pages)
+//! is required to support a higher ceiling.
 //!
 //! ## Terminal dust sweep
 //!
@@ -91,7 +122,7 @@
 //! It cannot run during a legal hold. Transfers go through [`crate::external_calls`] so **pre/post
 //! token balances** must match the requested amount (standard SEP-41 behavior); fee-on-transfer or
 //! malicious tokens are **explicitly out of scope** and fail with typed errors at the balance-check
-//! boundary. This is meant for rounding residue / stray transfers, not for settling live liabilities ΓÇö
+//! boundary. This is meant for rounding residue / stray transfers, not for settling live liabilities --
 //! integrations that custody principal on-chain must keep token balances reconciled with
 //! `funded_amount` so treasury sweeps cannot pull user funds.
 //!
@@ -101,7 +132,7 @@
 //! [`Env::ledger`] timestamps only (no wall-clock oracle). Maturity, per-investor **claim locks**
 //! from [`StarfundEscrow::fund_with_commitment`], and [`FundingCloseSnapshot`] metadata must be
 //! interpreted as **validator-observed ledger time**, including possible skew between simulated and
-//! live networksΓÇöintegrators should treat boundaries as `>=` / `<` tests on integer seconds.
+//! live networks--integrators should treat boundaries as `>=` / `<` tests on integer seconds.
 //!
 //! ## Optional tiered yield (immutable table at init)
 //!
@@ -137,12 +168,12 @@
 //! goes to the SME and no treasury transfer occurs.
 //!
 //! **Interaction with on-chain disbursement:** the fee is only realized when principal is
-//! custodied on-chain and the SME calls [`StarfundEscrow::withdraw`] ΓÇö this feature depends on
+//! custodied on-chain and the SME calls [`StarfundEscrow::withdraw`] -- this feature depends on
 //! the on-chain disbursement path. It does **not** apply to off-chain settlement
 //! ([`StarfundEscrow::settle`]), investor refunds ([`StarfundEscrow::refund`]), or investor
 //! claims ([`StarfundEscrow::claim_investor_payout`]). The treasury here is the same immutable
 //! address used by [`StarfundEscrow::sweep_terminal_dust`]; the fee transfer reuses the same
-//! SEP-41 balance-deltaΓÇôchecked path in [`external_calls`].
+//! SEP-41 balance-delta-checked path in [`external_calls`].
 
 #![allow(clippy::too_many_arguments)]
 
@@ -156,7 +187,16 @@ use soroban_sdk::{
 };
 
 pub mod external_calls;
+mod attestation;
+mod callback;
+mod fees;
 mod keys;
+
+#[cfg(any(test, feature = "testutils"))]
+mod fixtures;
+
+#[cfg(any(test, feature = "testutils"))]
+pub use fixtures::{DefaultMockToken, MOCK_TOKEN_DEFAULT_BALANCE};
 
 /// Compatibility defaults for older allowlist-limit tests and admin helpers.
 pub const DEFAULT_ALLOWLIST_LIMIT: u32 = 100;
@@ -177,11 +217,11 @@ pub const MAX_ALLOWLIST_LIMIT: u32 = 1_000;
 /// | Version | Summary | Upgrade path |
 /// |---------|---------|-------------|
 /// | 1 | Initial schema (`InvoiceEscrow` v1, basic fund / settle) | N/A |
-/// | 2 | Added `InvestorEffectiveYield`, `InvestorClaimNotBefore` | Additive keys ΓÇö no `migrate` call required |
-/// | 3 | Added `FundingCloseSnapshot`, `MinContributionFloor`, `MaxUniqueInvestorsCap`, `UniqueFunderCount` | Additive keys ΓÇö old instances return defaults |
-/// | 4 | Added `PrimaryAttestationHash`, `AttestationAppendLog` | Additive keys ΓÇö no `migrate` call required |
+/// | 2 | Added `InvestorEffectiveYield`, `InvestorClaimNotBefore` | Additive keys -- no `migrate` call required |
+/// | 3 | Added `FundingCloseSnapshot`, `MinContributionFloor`, `MaxUniqueInvestorsCap`, `UniqueFunderCount` | Additive keys -- old instances return defaults |
+/// | 4 | Added `PrimaryAttestationHash`, `AttestationAppendLog` | Additive keys -- no `migrate` call required |
 /// | 5 | Added `YieldTierTable`, `RegistryRef`, `Treasury`; `fund_with_commitment` | **Redeploy required** if `InvoiceEscrow` XDR changed |
-/// | 6 | Per-investor keys moved to **persistent** storage (see ADR-007) | **Redeploy required** ΓÇö no `migrate` path (addresses not enumerable) |
+/// | 6 | Per-investor keys moved to **persistent** storage (see ADR-007) | **Redeploy required** -- no `migrate` path (addresses not enumerable) |
 ///
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
 pub const SCHEMA_VERSION: u32 = 6;
@@ -478,6 +518,34 @@ pub const ALLOWLIST_PAGE_SIZE: u32 = 50;
 /// default host budget.
 pub const MAX_UNIQUE_INVESTORS: u32 = 10_000;
 
+/// Supported ceiling for a **configured** `max_unique_investors` value at
+/// [`StarfundEscrow::init`] (issue #421).
+///
+/// [`DataKey::InvestorIndex`] is a single **instance**-storage `Vec<Address>`, so every
+/// distinct investor appended to it grows one instance ledger entry. Instance storage is
+/// bounded by the host's per-entry size limit, which is reached well before
+/// [`MAX_UNIQUE_INVESTORS`] distinct addresses are recorded. Measurements in
+/// `release_budget_tests` (growing distinct investors under realistic ledger limits) show
+/// the first failure occurs when the serialized index approaches the instance-entry size
+/// ceiling; [`SUPPORTED_MAX_UNIQUE_INVESTORS`] is set with a safety margin below that point.
+///
+/// `init` rejects a configured `max_unique_investors` above this value with
+/// [`EscrowError::MaxUniqueInvestorsExceedsSupported`] **before any state is persisted**.
+/// The unconditional [`MAX_UNIQUE_INVESTORS`] hard cap in `fund_impl` is unchanged, so
+/// existing escrows below the supported ceiling keep byte-for-byte behavior.
+///
+/// # Legacy handling
+///
+/// Escrows initialized before this check existed may have a stored cap above
+/// [`SUPPORTED_MAX_UNIQUE_INVESTORS`]. They are **not** migrated or rejected retroactively:
+/// reads keep returning the stored cap, and funding continues to be bounded by
+/// [`MAX_UNIQUE_INVESTORS`]. Such instances may hit the instance-storage limit while
+/// appending to [`DataKey::InvestorIndex`]; operators should treat the first append failure
+/// as the effective ceiling and redeploy with a supported cap. A paged representation of
+/// `InvestorIndex` (mirroring [`ALLOWLIST_PAGE_SIZE`] paging) is the forward path if a
+/// higher supported ceiling is required.
+pub const SUPPORTED_MAX_UNIQUE_INVESTORS: u32 = 1_000;
+
 /// Documented worst-case **release-path** resource ceilings (issue #1229).
 ///
 /// These are the per-top-level-invocation CPU-instruction and memory-bytes budgets that every
@@ -686,6 +754,13 @@ pub enum EscrowError {
     MinContributionExceedsAmount = 7,
     /// [`StarfundEscrow::init`] configured `max_unique_investors` but it is not positive.
     MaxUniqueInvestorsNotPositive = 8,
+    /// [`StarfundEscrow::init`] configured `max_unique_investors` above
+    /// [`SUPPORTED_MAX_UNIQUE_INVESTORS`], which the single-entry
+    /// [`DataKey::InvestorIndex`] cannot hold within instance-storage limits.
+    ///
+    /// Rejected before any state is persisted. See [`SUPPORTED_MAX_UNIQUE_INVESTORS`] for
+    /// the measurement-backed ceiling and legacy handling.
+    MaxUniqueInvestorsExceedsSupported = 285,
     /// [`StarfundEscrow::init`] configured `max_per_investor` but it is not positive.
     MaxPerInvestorNotPositive = 9,
     /// [`StarfundEscrow::init`] rejected a tier with `yield_bps` outside `0..=10_000`.
@@ -9620,7 +9695,7 @@ impl StarfundEscrow {
         new_admin
     }
 
-    /// Accept a pending admin handover ΓÇö step 2 of a two-step handover.
+    /// Accept a pending admin handover -- step 2 of a two-step handover.
     ///
     /// The address stored in [`DataKey::PendingAdmin`] must authorize this call. On success, the
     /// successor is promoted into [`InvoiceEscrow::admin`], and the pending proposal keys
@@ -9722,7 +9797,7 @@ impl StarfundEscrow {
     ///
     /// # Errors
     ///
-    /// - [`EscrowError::NoPendingAdmin`] ΓÇö no proposal exists; nothing to cancel.
+    /// - [`EscrowError::NoPendingAdmin`] -- no proposal exists; nothing to cancel.
     ///
     /// # Returns
     ///
@@ -9827,7 +9902,7 @@ impl StarfundEscrow {
         pending
     }
 
-    /// Propose a new payer address via emergency recovery ΓÇö step 1 of a two-step payer handover.
+    /// Propose a new payer address via emergency recovery -- step 1 of a two-step payer handover.
     ///
     /// The admin may propose a new payer when the current payer key is lost or compromised.
     /// Unlike [`StarfundEscrow::rotate_payer`], which requires the current payer's authorization,
@@ -9901,7 +9976,7 @@ impl StarfundEscrow {
         new_payer
     }
 
-    /// Accept a pending payer recovery proposal ΓÇö step 2 of a two-step payer handover.
+    /// Accept a pending payer recovery proposal -- step 2 of a two-step payer handover.
     ///
     /// The address stored in [`DataKey::PendingPayer`] must authorize this call. On success,
     /// the pending payer is promoted into [`InvoiceEscrow::payer`], and the pending proposal
@@ -9965,7 +10040,7 @@ impl StarfundEscrow {
         escrow
     }
 
-    /// Cancel a pending payer recovery proposal ΓÇö admin-only abort.
+    /// Cancel a pending payer recovery proposal -- admin-only abort.
     ///
     /// Removes [`DataKey::PendingPayer`] and [`DataKey::PendingPayerExpiry`] so the previously
     /// nominated address can no longer call [`StarfundEscrow::accept_payer_recovery`]. The current
@@ -10139,7 +10214,7 @@ impl StarfundEscrow {
     /// per entry.
     ///
     /// Already-refunded entries (where [`DataKey::InvestorRefunded`] is already `true`) are
-    /// **skipped** without failing the batch ΓÇö this makes the entrypoint idempotent and
+    /// **skipped** without failing the batch -- this makes the entrypoint idempotent and
     /// allows relayer-style retry without needing to prune the list.
     ///
     /// # Parameters
@@ -10149,7 +10224,7 @@ impl StarfundEscrow {
     /// - [`EscrowError::RefundBatchEmpty`] if `investors` is empty
     /// - [`EscrowError::RefundBatchTooLarge`] if `investors.len() > [`MAX_REFUND_BATCH`]
     ///
-    /// Per-entry errors (non-cancelled status, auth failure) are **not** silently skipped ΓÇö they
+    /// Per-entry errors (non-cancelled status, auth failure) are **not** silently skipped -- they
     /// terminate the entire batch. Entries with no recorded contribution (zero balance) and
     /// already-refunded entries (where [`DataKey::InvestorRefunded`] is `true`) are safely skipped.
     ///
@@ -10201,7 +10276,7 @@ impl StarfundEscrow {
     ///
     /// # Parameters
     /// - `investor`: The address whose contribution is being reduced. Must match `require_auth`.
-    /// - `amount`: The positive amount to withdraw (must be Γëñ recorded contribution).
+    /// - `amount`: The positive amount to withdraw (must be <= recorded contribution).
     ///
     /// # Errors
     /// - [`EscrowError::UnfundEscrowNotOpen`] if `status != 0`.
@@ -10357,7 +10432,7 @@ impl StarfundEscrow {
     /// [`StarfundEscrow::withdraw`], or [`StarfundEscrow::refund`].
     ///
     /// Used by [`StarfundEscrow::sweep_terminal_dust`] to compute outstanding liabilities.
-    /// Absent ΓçÆ `0` (no principal has been distributed).
+    /// Absent -> `0` (no principal has been distributed).
     pub fn get_distributed_principal(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -10446,65 +10521,10 @@ impl StarfundEscrow {
     ///
     /// # Returns
     /// The allocated unique invocation nonce (`u64`).
+    ///
+    /// Implementation lives in [`crate::callback`] (issue #388).
     pub fn register_callback(env: Env, origin: Address, phase: u32) -> u64 {
-        let escrow = Self::load_escrow_require_admin(&env);
-
-        ensure(
-            &env,
-            escrow.status == 0 || escrow.status == 1,
-            EscrowError::CallbackOnTerminalEscrow,
-        );
-
-        // Bound the pending set *before* any mutation so a rejected registration
-        // leaves storage untouched (atomic failure).
-        let mut pending_callbacks = Self::pending_callback_nonces(&env);
-        ensure(
-            &env,
-            pending_callbacks.len() < MAX_PENDING_CALLBACKS,
-            EscrowError::TooManyPendingCallbacks,
-        );
-
-        let current_nonce: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CallbackNonce)
-            .unwrap_or(0);
-        let next_nonce = current_nonce
-            .checked_add(1)
-            .unwrap_or_else(|| fail(&env, EscrowError::FundedAmountOverflow));
-
-        pending_callbacks.push_back(next_nonce);
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingCallbackNonces, &pending_callbacks);
-
-        env.storage()
-            .instance()
-            .set(&DataKey::CallbackNonce, &next_nonce);
-
-        let now = env.ledger().timestamp();
-        let context = CallbackContext {
-            origin: origin.clone(),
-            nonce: next_nonce,
-            phase,
-            created_at: now,
-            consumed: false,
-        };
-
-        env.storage()
-            .instance()
-            .set(&DataKey::CallbackContext(next_nonce), &context);
-
-        CallbackRegisteredEvent {
-            name: symbol_short!("cb_reg"),
-            invoice_id: escrow.invoice_id,
-            origin,
-            nonce: next_nonce,
-            phase,
-        }
-        .publish(&env);
-
-        next_nonce
+        crate::callback::register_callback(&env, origin, phase)
     }
 
     /// Execute and consume a registered cross-contract callback.
@@ -10533,67 +10553,16 @@ impl StarfundEscrow {
     ///
     /// # Returns
     /// The updated [`CallbackContext`] snapshot with `consumed == true`.
+    ///
+    /// Implementation lives in [`crate::callback`] (issue #388).
     pub fn execute_callback(env: Env, nonce: u64, origin: Address, phase: u32) -> CallbackContext {
-        let escrow = Self::get_escrow(env.clone());
-
-        ensure(
-            &env,
-            escrow.status != 4,
-            EscrowError::CallbackAfterCancellation,
-        );
-
-        origin.require_auth();
-
-        let mut context: CallbackContext = env
-            .storage()
-            .instance()
-            .get(&DataKey::CallbackContext(nonce))
-            .unwrap_or_else(|| fail(&env, EscrowError::CallbackNotFound));
-
-        ensure(&env, !context.consumed, EscrowError::CallbackReplayed);
-
-        ensure(
-            &env,
-            context.origin == origin,
-            EscrowError::CallbackWrongOrigin,
-        );
-
-        ensure(
-            &env,
-            context.nonce == nonce,
-            EscrowError::CallbackWrongNonce,
-        );
-
-        ensure(
-            &env,
-            context.phase == phase,
-            EscrowError::CallbackWrongPhase,
-        );
-
-        context.consumed = true;
-        env.storage()
-            .instance()
-            .set(&DataKey::CallbackContext(nonce), &context);
-        Self::remove_pending_callback_nonce(&env, nonce);
-
-        CallbackExecutedEvent {
-            name: symbol_short!("cb_exec"),
-            invoice_id: escrow.invoice_id,
-            origin,
-            nonce,
-            phase,
-        }
-        .publish(&env);
-
-        context
+        crate::callback::execute_callback(&env, nonce, origin, phase)
     }
 
     /// Read-only view returning the registered callback context for a given invocation `nonce`.
     /// Returns `None` if no callback was registered with this nonce.
     pub fn get_callback(env: Env, nonce: u64) -> Option<CallbackContext> {
-        env.storage()
-            .instance()
-            .get(&DataKey::CallbackContext(nonce))
+        crate::callback::get_callback(&env, nonce)
     }
 
     /// Diagnostic classification of an investor's claim marker
@@ -10627,156 +10596,13 @@ impl StarfundEscrow {
     /// Read-only view returning the current callback invocation nonce counter.
     /// Returns `0` if no callbacks have been registered.
     pub fn get_callback_nonce(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::CallbackNonce)
-            .unwrap_or(0)
+        crate::callback::get_callback_nonce(&env)
     }
 
     /// Read-only view returning whether the callback for `nonce` has been consumed.
     /// Returns `false` if the callback is unconsumed or does not exist.
     pub fn is_callback_consumed(env: Env, nonce: u64) -> bool {
-        let context: Option<CallbackContext> = env
-            .storage()
-            .instance()
-            .get(&DataKey::CallbackContext(nonce));
-        context.map(|c| c.consumed).unwrap_or(false)
-    }
-
-    /// Read-only, paginated enumeration of **unconsumed** callback contexts.
-    ///
-    /// Operators can inspect outstanding callbacks without knowing nonces or
-    /// replaying the full event history. The page walks the persisted pending
-    /// nonce index (never the historical `1..=CallbackNonce` range), skips
-    /// consumed or missing contexts, and returns at most `limit` contexts.
-    ///
-    /// This is a pure read: no authorization, no storage writes, no events.
-    ///
-    /// # Arguments
-    /// - `start`: zero-based offset into the pending nonce index.
-    /// - `limit`: maximum number of contexts to return; must be in
-    ///   `1..=MAX_CALLBACK_PAGE_LIMIT`.
-    ///
-    /// # Errors
-    /// - [`EscrowError::CallbackPageLimitOutOfRange`] if `limit` is `0` or above
-    ///   [`MAX_CALLBACK_PAGE_LIMIT`].
-    pub fn get_pending_callbacks(
-        env: Env,
-        start: u32,
-        limit: u32,
-    ) -> Vec<CallbackContext> {
-        ensure(
-            &env,
-            limit > 0 && limit <= MAX_CALLBACK_PAGE_LIMIT,
-            EscrowError::CallbackPageLimitOutOfRange,
-        );
-
-        let pending = Self::pending_callback_nonces(&env);
-        let mut out = Vec::new(&env);
-        let mut index = start;
-        while index < pending.len() && out.len() < limit {
-            let nonce = pending.get(index).unwrap();
-            if let Some(context) = env
-                .storage()
-                .instance()
-                .get::<DataKey, CallbackContext>(&DataKey::CallbackContext(nonce))
-            {
-                if !context.consumed {
-                    out.push_back(context);
-                }
-            }
-            index += 1;
-        }
-        out
-    }
-
-    /// Return the persisted pending callback nonce index.
-    ///
-    /// If the index is missing (legacy instance written before the index
-    /// existed), it is reconstructed **incrementally**: each call inspects at
-    /// most [`CALLBACK_RECONSTRUCTION_BATCH`] historical nonces starting at the
-    /// persisted [`DataKey::CallbackReconstructCursor`], appends any unconsumed
-    /// contexts found, and advances the cursor. Reconstruction is complete when
-    /// the cursor reaches [`DataKey::CallbackNonce`]; only then is the index
-    /// written and the cursor cleared. No pending callback is lost because the
-    /// cursor never skips a nonce.
-    fn pending_callback_nonces(env: &Env) -> Vec<u64> {
-        if let Some(pending) = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingCallbackNonces)
-        {
-            return pending;
-        }
-
-        let last_nonce: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CallbackNonce)
-            .unwrap_or(0);
-
-        let mut pending = env
-            .storage()
-            .instance()
-            .get::<DataKey, Vec<u64>>(&DataKey::PendingCallbackRebuild)
-            .unwrap_or_else(|| Vec::new(env));
-
-        let mut cursor: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CallbackReconstructCursor)
-            .unwrap_or(0);
-
-        let mut scanned: u32 = 0;
-        while cursor < last_nonce && scanned < CALLBACK_RECONSTRUCTION_BATCH {
-            cursor += 1;
-            scanned += 1;
-            let context: Option<CallbackContext> = env
-                .storage()
-                .instance()
-                .get(&DataKey::CallbackContext(cursor));
-            if context.map(|context| !context.consumed).unwrap_or(false) {
-                pending.push_back(cursor);
-            }
-        }
-
-        if cursor >= last_nonce {
-            // Reconstruction complete: publish the index and clear scratch state.
-            env.storage()
-                .instance()
-                .set(&DataKey::PendingCallbackNonces, &pending);
-            env.storage()
-                .instance()
-                .remove(&DataKey::CallbackReconstructCursor);
-            env.storage()
-                .instance()
-                .remove(&DataKey::PendingCallbackRebuild);
-        } else {
-            // Persist bounded progress so the next call resumes where this one stopped.
-            env.storage()
-                .instance()
-                .set(&DataKey::CallbackReconstructCursor, &cursor);
-            env.storage()
-                .instance()
-                .set(&DataKey::PendingCallbackRebuild, &pending);
-        }
-
-        pending
-    }
-
-    fn remove_pending_callback_nonce(env: &Env, nonce: u64) {
-        let mut pending = Self::pending_callback_nonces(env);
-        let mut index = 0;
-        while index < pending.len() {
-            if pending.get(index) == Some(nonce) {
-                pending.remove(index);
-                break;
-            }
-            index += 1;
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingCallbackNonces, &pending);
+        crate::callback::is_callback_consumed(&env, nonce)
     }
 }
 
@@ -11162,67 +10988,7 @@ mod callback_diagnostics_tests {
 // #[cfg(test)]
 // mod release_budget_tests;
 
-/// Default starting balance assigned to any address that has never been seen by the
-/// [`DefaultMockToken`] contract.
-///
-/// The value (100 trillion stroops, i.e. 10 000 000 XLM at 7 decimal places) is large
-/// enough that ordinary test escrow amounts never accidentally overdraw an account,
-/// while still being representable in a signed 64-bit integer.  Defined once here so
-/// that `balance` and `transfer` stay in sync and a single edit suffices to change the
-/// test-harness funding level.  Large-principal tests that fund above this ceiling must
-/// provision balances via a real Stellar asset token (see `install_stellar_asset_token`).
-#[cfg(any(test, feature = "testutils"))]
-pub const MOCK_TOKEN_DEFAULT_BALANCE: i128 = 100_000_000_000_000i128;
-
-#[cfg(any(test, feature = "testutils"))]
-#[soroban_sdk::contract]
-pub struct DefaultMockToken;
-
-#[cfg(any(test, feature = "testutils"))]
-#[soroban_sdk::contractimpl]
-impl DefaultMockToken {
-    pub fn balance(env: soroban_sdk::Env, addr: soroban_sdk::Address) -> i128 {
-        let key = soroban_sdk::symbol_short!("balances");
-        let mut balances: soroban_sdk::Map<soroban_sdk::Address, i128> = env
-            .storage()
-            .instance()
-            .get(&key)
-            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
-        balances.get(addr).unwrap_or(100_000_000_000_000i128)
-    }
-
-    pub fn transfer(
-        env: soroban_sdk::Env,
-        from: soroban_sdk::Address,
-        to: soroban_sdk::Address,
-        amount: i128,
-    ) {
-        let key = soroban_sdk::symbol_short!("balances");
-        let mut balances: soroban_sdk::Map<soroban_sdk::Address, i128> = env
-            .storage()
-            .instance()
-            .get(&key)
-            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
-        let from_bal = balances
-            .get(from.clone())
-            .unwrap_or(100_000_000_000_000i128);
-        let to_bal = balances.get(to.clone()).unwrap_or(100_000_000_000_000i128);
-        balances.set(from.clone(), from_bal - amount);
-        balances.set(to.clone(), to_bal + amount);
-        env.storage().instance().set(&key, &balances);
-    }
-}
-
-#[cfg(any(test, feature = "testutils"))]
-fn register_mock_token_if_needed(env: &Env, token_addr: &Address) {
-    use std::panic::AssertUnwindSafe;
-    let env_clone = env.clone();
-    let token_clone = token_addr.clone();
-    let result = std::panic::catch_unwind(AssertUnwindSafe(move || {
-        let client = TokenClient::new(&env_clone, &token_clone);
-        let _ = client.balance(&token_clone);
-    }));
-    if result.is_err() {
-        env.register_at(token_addr, DefaultMockToken, ());
-    }
-}
+// Native token fixtures (`DefaultMockToken`, `MOCK_TOKEN_DEFAULT_BALANCE`, and the
+// registration scaffolding) now live in `escrow/src/fixtures.rs` behind an explicit
+// `cfg(any(test, feature = "testutils"))` boundary so production WASM excludes them.
+// See issue #387.

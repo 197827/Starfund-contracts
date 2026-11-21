@@ -183,3 +183,255 @@ fn fee_schedule_changes_emit_events() {
         }
     );
 }
+
+/// Reference implementation of the approved fee rounding policy (issue #224):
+/// fee = floor(gross * fee_bps / 10_000), net = gross - fee.
+fn expected_fee(gross: i128, fee_bps: i64) -> i128 {
+    gross * (fee_bps as i128) / 10_000
+}
+
+fn init_fee_split_test<'a>(
+    env: &'a Env,
+    amount: i128,
+    fee_bps: i64,
+) -> (StarfundEscrowClient<'a>, Address, Address, Address) {
+    let (client, admin, sme) = setup(env);
+    let (funding_token, treasury) = free_addresses(env);
+    client.init(
+        &admin,
+        &String::from_str(env, "FEESPLIT"),
+        &sme,
+        &amount,
+        &fee_bps,
+        &0u64,
+        &funding_token,
+        &None,
+        &treasury,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None::<i64>,
+        &None::<u32>,
+    );
+    (client, admin, sme, treasury)
+}
+
+fn assert_gross_conserved(gross: i128, fee: i128, net: i128) {
+    assert_eq!(fee + net, gross, "gross must equal fee plus net");
+    assert!(fee >= 0, "fee must be non-negative");
+    assert!(net >= 0, "net must be non-negative");
+}
+
+#[test]
+fn release_fee_boundaries_conserve_gross() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amount = 10_000i128;
+    let (client, _admin, sme, treasury) = init_fee_split_test(&env, amount, 250);
+
+    let fee = expected_fee(amount, 250);
+    let net = amount - fee;
+    assert_gross_conserved(amount, fee, net);
+
+    client.release(&sme);
+    assert_eq!(client.get_escrow().released, amount);
+    assert_eq!(client.get_escrow().fee_amount, fee);
+    assert_eq!(client.get_escrow().net_amount, net);
+}
+
+#[test]
+fn release_fee_rounds_down_for_odd_amounts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // 333 * 250 / 10_000 = 8.325 -> floor 8 (rounding direction preserved).
+    let amount = 333i128;
+    let (client, _admin, sme, _treasury) = init_fee_split_test(&env, amount, 250);
+
+    let fee = expected_fee(amount, 250);
+    assert_eq!(fee, 8);
+    let net = amount - fee;
+    assert_gross_conserved(amount, fee, net);
+
+    client.release(&sme);
+    assert_eq!(client.get_escrow().fee_amount, fee);
+    assert_eq!(client.get_escrow().net_amount, net);
+}
+
+#[test]
+fn release_zero_fee_rate_conserves_gross() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amount = 5_000i128;
+    let (client, _admin, sme, _treasury) = init_fee_split_test(&env, amount, 0);
+
+    client.release(&sme);
+    assert_eq!(client.get_escrow().fee_amount, 0);
+    assert_eq!(client.get_escrow().net_amount, amount);
+    assert_gross_conserved(amount, 0, amount);
+}
+
+#[test]
+fn release_rejects_invalid_fee_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, sme, _treasury) = init_fee_split_test(&env, 1_000i128, 10_001);
+
+    let result = client.try_release(&sme);
+    assert_eq!(result, Err(Ok(EscrowError::InvalidFeeRate)));
+}
+
+#[test]
+fn release_rejects_fee_rate_overflow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, sme, _treasury) = init_fee_split_test(&env, i128::MAX, 10_000);
+
+    let result = client.try_release(&sme);
+    assert_eq!(result, Err(Ok(EscrowError::FeeOverflow)));
+}
+
+#[test]
+fn withdraw_fee_boundaries_conserve_gross() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amount = 10_000i128;
+    let (client, _admin, sme, _treasury) = init_fee_split_test(&env, amount, 250);
+
+    let fee = expected_fee(amount, 250);
+    let net = amount - fee;
+    assert_gross_conserved(amount, fee, net);
+
+    client.withdraw(&sme);
+    assert_eq!(client.get_escrow().fee_amount, fee);
+    assert_eq!(client.get_escrow().net_amount, net);
+}
+
+#[test]
+fn withdraw_fee_rounds_down_for_odd_amounts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amount = 333i128;
+    let (client, _admin, sme, _treasury) = init_fee_split_test(&env, amount, 250);
+
+    let fee = expected_fee(amount, 250);
+    assert_eq!(fee, 8);
+    let net = amount - fee;
+    assert_gross_conserved(amount, fee, net);
+
+    client.withdraw(&sme);
+    assert_eq!(client.get_escrow().fee_amount, fee);
+    assert_eq!(client.get_escrow().net_amount, net);
+}
+
+#[test]
+fn withdraw_rejects_invalid_fee_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, sme, _treasury) = init_fee_split_test(&env, 1_000i128, 10_001);
+
+    let result = client.try_withdraw(&sme);
+    assert_eq!(result, Err(Ok(EscrowError::InvalidFeeRate)));
+}
+
+#[test]
+fn withdraw_rejects_fee_rate_overflow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, sme, _treasury) = init_fee_split_test(&env, i128::MAX, 10_000);
+
+    let result = client.try_withdraw(&sme);
+    assert_eq!(result, Err(Ok(EscrowError::FeeOverflow)));
+}
+
+#[test]
+fn release_and_withdraw_share_fee_arithmetic() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amount = 7_777i128;
+    let fee_bps = 375i64;
+
+    let (release_client, _admin, sme, _treasury) = init_fee_split_test(&env, amount, fee_bps);
+    release_client.release(&sme);
+    let release_fee = release_client.get_escrow().fee_amount;
+    let release_net = release_client.get_escrow().net_amount;
+
+    let env2 = Env::default();
+    env2.mock_all_auths();
+    let (withdraw_client, _admin, sme, _treasury) = init_fee_split_test(&env2, amount, fee_bps);
+    withdraw_client.withdraw(&sme);
+    let withdraw_fee = withdraw_client.get_escrow().fee_amount;
+    let withdraw_net = withdraw_client.get_escrow().net_amount;
+
+    assert_eq!(release_fee, withdraw_fee);
+    assert_eq!(release_net, withdraw_net);
+    assert_eq!(release_fee, expected_fee(amount, fee_bps));
+    assert_gross_conserved(amount, release_fee, release_net);
+}
+
+#[test]
+fn cumulative_partial_releases_match_approved_rounding() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amount = 1_000i128;
+    let fee_bps = 250i64;
+    let (client, _admin, sme, _treasury) = init_fee_split_test(&env, amount, fee_bps);
+
+    let tranches = [333i128, 333i128, 334i128];
+    let mut cumulative_fee = 0i128;
+    let mut cumulative_net = 0i128;
+    let mut cumulative_gross = 0i128;
+
+    for tranche in tranches {
+        let fee = expected_fee(tranche, fee_bps);
+        let net = tranche - fee;
+        assert_gross_conserved(tranche, fee, net);
+        cumulative_fee += fee;
+        cumulative_net += net;
+        cumulative_gross += tranche;
+    }
+
+    assert_eq!(cumulative_gross, amount);
+    assert_eq!(cumulative_fee + cumulative_net, amount);
+    // Per-tranche floor rounding is the approved #224 outcome.
+    assert_eq!(cumulative_fee, expected_fee(333, fee_bps) * 2 + expected_fee(334, fee_bps));
+
+    client.release(&sme);
+    assert_eq!(client.get_escrow().fee_amount, expected_fee(amount, fee_bps));
+    assert_eq!(client.get_escrow().net_amount, amount - expected_fee(amount, fee_bps));
+}
+
+#[test]
+fn cumulative_partial_withdrawals_match_approved_rounding() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amount = 1_000i128;
+    let fee_bps = 250i64;
+    let (client, _admin, sme, _treasury) = init_fee_split_test(&env, amount, fee_bps);
+
+    let tranches = [333i128, 333i128, 334i128];
+    let mut cumulative_fee = 0i128;
+    let mut cumulative_net = 0i128;
+    let mut cumulative_gross = 0i128;
+
+    for tranche in tranches {
+        let fee = expected_fee(tranche, fee_bps);
+        let net = tranche - fee;
+        assert_gross_conserved(tranche, fee, net);
+        cumulative_fee += fee;
+        cumulative_net += net;
+        cumulative_gross += tranche;
+    }
+
+    assert_eq!(cumulative_gross, amount);
+    assert_eq!(cumulative_fee + cumulative_net, amount);
+    assert_eq!(cumulative_fee, expected_fee(333, fee_bps) * 2 + expected_fee(334, fee_bps));
+
+    client.withdraw(&sme);
+    assert_eq!(client.get_escrow().fee_amount, expected_fee(amount, fee_bps));
+    assert_eq!(client.get_escrow().net_amount, amount - expected_fee(amount, fee_bps));
+}

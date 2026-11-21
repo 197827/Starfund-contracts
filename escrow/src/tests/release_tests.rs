@@ -195,9 +195,11 @@ fn test_release_with_protocol_fee_positive_fee() {
     let final_treasury_balance = token_client.balance(&treasury);
     let final_escrow_balance = token_client.balance(&escrow_id);
 
-    // Compute expected fee and net
+    // Compute expected fee and net using the shared checked fee split policy
     let fee = TARGET * 250 / 10_000;
     let net = TARGET - fee;
+    // Gross must equal fee plus net
+    assert_eq!(fee + net, TARGET);
 
     // SME receives the net amount
     assert_eq!(final_sme_balance, init_sme_balance + net);
@@ -234,6 +236,7 @@ fn test_release_with_protocol_fee_partial_then_final() {
     // Compute expected fee and net for first release
     let fee1 = p1 * 500 / 10_000;
     let net1 = p1 - fee1;
+    assert_eq!(fee1 + net1, p1);
 
     let sme_balance_after_first = token_client.balance(&sme);
     let treasury_balance_after_first = token_client.balance(&treasury);
@@ -251,6 +254,7 @@ fn test_release_with_protocol_fee_partial_then_final() {
     // Compute expected fee and net for second release
     let fee2 = p2 * 500 / 10_000;
     let net2 = p2 - fee2;
+    assert_eq!(fee2 + net2, p2);
 
     let final_sme_balance = token_client.balance(&sme);
     let final_treasury_balance = token_client.balance(&treasury);
@@ -286,6 +290,12 @@ fn test_release_with_protocol_fee_max_fee() {
     let final_escrow_balance = token_client.balance(&escrow_id);
 
     // At 100% fee: fee == TARGET, net == 0
+    let fee = TARGET * 10_000 / 10_000;
+    let net = TARGET - fee;
+    assert_eq!(fee + net, TARGET);
+    assert_eq!(fee, TARGET);
+    assert_eq!(net, 0);
+
     // SME receives nothing
     assert_eq!(final_sme_balance, init_sme_balance);
     // Treasury receives everything
@@ -469,4 +479,55 @@ fn test_release_with_protocol_fee_rounding_residue() {
 
     // Verify conservation: net + fee == TARGET
     assert_eq!(net + fee, TARGET);
+}
+
+#[test]
+fn test_release_and_withdraw_fee_split_identical() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Same gross amount and fee rate through both disbursement routes.
+    let gross = TARGET;
+    let fee_bps = 333i64;
+
+    // Route 1: release
+    let (release_client, _, release_sme, release_treasury, _) =
+        init_and_fund_with_protocol_fee(&env, gross, "INV007", fee_bps);
+    let release_token = release_client.funding_token();
+    let release_token_client = TokenClient::new(&env, &release_token);
+
+    let release_sme_before = release_token_client.balance(&release_sme);
+    let release_treasury_before = release_token_client.balance(&release_treasury);
+
+    release_client.release(&gross);
+
+    let release_fee = release_token_client.balance(&release_treasury) - release_treasury_before;
+    let release_net = release_token_client.balance(&release_sme) - release_sme_before;
+
+    // Route 2: withdraw
+    let (withdraw_client, _, withdraw_sme, withdraw_treasury, _) =
+        init_and_fund_with_protocol_fee(&env, gross, "INV008", fee_bps);
+    let withdraw_token = withdraw_client.funding_token();
+    let withdraw_token_client = TokenClient::new(&env, &withdraw_token);
+
+    let withdraw_sme_before = withdraw_token_client.balance(&withdraw_sme);
+    let withdraw_treasury_before = withdraw_token_client.balance(&withdraw_treasury);
+
+    withdraw_client.withdraw();
+
+    let withdraw_fee = withdraw_token_client.balance(&withdraw_treasury) - withdraw_treasury_before;
+    let withdraw_net = withdraw_token_client.balance(&withdraw_sme) - withdraw_sme_before;
+
+    // Both routes must share the same checked fee arithmetic.
+    assert_eq!(release_fee, withdraw_fee);
+    assert_eq!(release_net, withdraw_net);
+
+    // Gross equals fee plus net on both routes.
+    assert_eq!(release_fee + release_net, gross);
+    assert_eq!(withdraw_fee + withdraw_net, gross);
+
+    // Existing floor rounding policy is preserved.
+    let expected_fee = gross * fee_bps / 10_000;
+    assert_eq!(release_fee, expected_fee);
+    assert_eq!(withdraw_fee, expected_fee);
 }

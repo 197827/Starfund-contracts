@@ -3,7 +3,7 @@
 //!
 //! Holds investor funds for an invoice until settlement.
 //! - SME receives stablecoin when funding target is met ([`StarfundEscrow::withdraw`])
-//! - SME records optional **collateral commitments** ([`StarfundEscrow::record_sme_collateral_commitment`]) ΓÇö
+//! - SME records optional **collateral commitments** ([`StarfundEscrow::record_sme_collateral_commitment`]) --
 //!   these are **ledger records only**; they do **not** move tokens, freeze balances,
 //!   reserve assets, or create an enforceable on-chain claim.
 //! - [`StarfundEscrow::settle`] finalizes the escrow after maturity (when configured).
@@ -13,7 +13,7 @@
 //! The constant [`SCHEMA_VERSION`] is written to [`DataKey::Version`] by [`StarfundEscrow::init`]
 //! and is the canonical source of truth for upgrade decisions. **Current value: 6.**
 //!
-//! [`StarfundEscrow::migrate`] **fails with typed errors in all current execution paths** ΓÇö no
+//! [`StarfundEscrow::migrate`] **fails with typed errors in all current execution paths** -- no
 //! silent migration work is promised or performed. Operators must extend `migrate` before calling
 //! it, or redeploy when stored struct layout changes. See `docs/OPERATOR_RUNBOOK.md` for the full
 //! decision tree.
@@ -58,14 +58,14 @@
 //! ## Authorization guard ordering
 //!
 //! Every state-mutating entrypoint follows a canonical sequence (see
-//! `docs/escrow-security-checklist.md` ┬º6 and [ADR-002](docs/adr/ADR-002-auth-boundaries.md)):
+//! `docs/escrow-security-checklist.md` section 6 and [ADR-002](docs/adr/ADR-002-auth-boundaries.md)):
 //!
 //! 1. **Read-only** preconditions (legal hold, status checks, input validation).
 //! 2. **`Address::require_auth()`** for the bound role ([Stellar authorization](https://developers.stellar.org/docs/build/guides/auth/contract-authorization)).
 //! 3. **Storage writes** and **SEP-41 transfers** (via [`external_calls`]).
 //!
 //! Invariant: no instance/persistent storage mutation and no token transfer occurs until
-//! step 2 succeeds. Reading [`DataKey::Escrow`] before `require_auth` is intentional ΓÇö it is
+//! step 2 succeeds. Reading [`DataKey::Escrow`] before `require_auth` is intentional -- it is
 //! read-only and does not weaken the auth boundary.
 //!
 //! ## Invoice identifier (`invoice_id`)
@@ -79,7 +79,7 @@
 //!
 //! Each escrow instance binds exactly one **funding token** contract ([`DataKey::FundingToken`])
 //! at [`StarfundEscrow::init`]; it cannot be changed after deploy. An optional **registry**
-//! ([`DataKey::RegistryRef`]) is a read-only discoverability hint only ΓÇö it is **not** an authority
+//! ([`DataKey::RegistryRef`]) is a read-only discoverability hint only -- it is **not** an authority
 //! for this contract and must not be used on-chain as proof of registry state without calling the
 //! registry yourself.
 //!
@@ -91,7 +91,7 @@
 //! It cannot run during a legal hold. Transfers go through [`crate::external_calls`] so **pre/post
 //! token balances** must match the requested amount (standard SEP-41 behavior); fee-on-transfer or
 //! malicious tokens are **explicitly out of scope** and fail with typed errors at the balance-check
-//! boundary. This is meant for rounding residue / stray transfers, not for settling live liabilities ΓÇö
+//! boundary. This is meant for rounding residue / stray transfers, not for settling live liabilities --
 //! integrations that custody principal on-chain must keep token balances reconciled with
 //! `funded_amount` so treasury sweeps cannot pull user funds.
 //!
@@ -101,7 +101,7 @@
 //! [`Env::ledger`] timestamps only (no wall-clock oracle). Maturity, per-investor **claim locks**
 //! from [`StarfundEscrow::fund_with_commitment`], and [`FundingCloseSnapshot`] metadata must be
 //! interpreted as **validator-observed ledger time**, including possible skew between simulated and
-//! live networksΓÇöintegrators should treat boundaries as `>=` / `<` tests on integer seconds.
+//! live networks--integrators should treat boundaries as `>=` / `<` tests on integer seconds.
 //!
 //! ## Optional tiered yield (immutable table at init)
 //!
@@ -137,12 +137,12 @@
 //! goes to the SME and no treasury transfer occurs.
 //!
 //! **Interaction with on-chain disbursement:** the fee is only realized when principal is
-//! custodied on-chain and the SME calls [`StarfundEscrow::withdraw`] ΓÇö this feature depends on
+//! custodied on-chain and the SME calls [`StarfundEscrow::withdraw`] -- this feature depends on
 //! the on-chain disbursement path. It does **not** apply to off-chain settlement
 //! ([`StarfundEscrow::settle`]), investor refunds ([`StarfundEscrow::refund`]), or investor
 //! claims ([`StarfundEscrow::claim_investor_payout`]). The treasury here is the same immutable
 //! address used by [`StarfundEscrow::sweep_terminal_dust`]; the fee transfer reuses the same
-//! SEP-41 balance-deltaΓÇôchecked path in [`external_calls`].
+//! SEP-41 balance-delta-checked path in [`external_calls`].
 
 #![allow(clippy::too_many_arguments)]
 
@@ -177,11 +177,11 @@ pub const MAX_ALLOWLIST_LIMIT: u32 = 1_000;
 /// | Version | Summary | Upgrade path |
 /// |---------|---------|-------------|
 /// | 1 | Initial schema (`InvoiceEscrow` v1, basic fund / settle) | N/A |
-/// | 2 | Added `InvestorEffectiveYield`, `InvestorClaimNotBefore` | Additive keys ΓÇö no `migrate` call required |
-/// | 3 | Added `FundingCloseSnapshot`, `MinContributionFloor`, `MaxUniqueInvestorsCap`, `UniqueFunderCount` | Additive keys ΓÇö old instances return defaults |
-/// | 4 | Added `PrimaryAttestationHash`, `AttestationAppendLog` | Additive keys ΓÇö no `migrate` call required |
+/// | 2 | Added `InvestorEffectiveYield`, `InvestorClaimNotBefore` | Additive keys -- no `migrate` call required |
+/// | 3 | Added `FundingCloseSnapshot`, `MinContributionFloor`, `MaxUniqueInvestorsCap`, `UniqueFunderCount` | Additive keys -- old instances return defaults |
+/// | 4 | Added `PrimaryAttestationHash`, `AttestationAppendLog` | Additive keys -- no `migrate` call required |
 /// | 5 | Added `YieldTierTable`, `RegistryRef`, `Treasury`; `fund_with_commitment` | **Redeploy required** if `InvoiceEscrow` XDR changed |
-/// | 6 | Per-investor keys moved to **persistent** storage (see ADR-007) | **Redeploy required** ΓÇö no `migrate` path (addresses not enumerable) |
+/// | 6 | Per-investor keys moved to **persistent** storage (see ADR-007) | **Redeploy required** -- no `migrate` path (addresses not enumerable) |
 ///
 /// See `docs/OPERATOR_RUNBOOK.md` for the full redeploy-vs-upgrade decision tree.
 pub const SCHEMA_VERSION: u32 = 6;
@@ -9620,7 +9620,7 @@ impl StarfundEscrow {
         new_admin
     }
 
-    /// Accept a pending admin handover ΓÇö step 2 of a two-step handover.
+    /// Accept a pending admin handover -- step 2 of a two-step handover.
     ///
     /// The address stored in [`DataKey::PendingAdmin`] must authorize this call. On success, the
     /// successor is promoted into [`InvoiceEscrow::admin`], and the pending proposal keys
@@ -9722,7 +9722,7 @@ impl StarfundEscrow {
     ///
     /// # Errors
     ///
-    /// - [`EscrowError::NoPendingAdmin`] ΓÇö no proposal exists; nothing to cancel.
+    /// - [`EscrowError::NoPendingAdmin`] -- no proposal exists; nothing to cancel.
     ///
     /// # Returns
     ///
@@ -9827,7 +9827,7 @@ impl StarfundEscrow {
         pending
     }
 
-    /// Propose a new payer address via emergency recovery ΓÇö step 1 of a two-step payer handover.
+    /// Propose a new payer address via emergency recovery -- step 1 of a two-step payer handover.
     ///
     /// The admin may propose a new payer when the current payer key is lost or compromised.
     /// Unlike [`StarfundEscrow::rotate_payer`], which requires the current payer's authorization,
@@ -9901,7 +9901,7 @@ impl StarfundEscrow {
         new_payer
     }
 
-    /// Accept a pending payer recovery proposal ΓÇö step 2 of a two-step payer handover.
+    /// Accept a pending payer recovery proposal -- step 2 of a two-step payer handover.
     ///
     /// The address stored in [`DataKey::PendingPayer`] must authorize this call. On success,
     /// the pending payer is promoted into [`InvoiceEscrow::payer`], and the pending proposal
@@ -9965,7 +9965,7 @@ impl StarfundEscrow {
         escrow
     }
 
-    /// Cancel a pending payer recovery proposal ΓÇö admin-only abort.
+    /// Cancel a pending payer recovery proposal -- admin-only abort.
     ///
     /// Removes [`DataKey::PendingPayer`] and [`DataKey::PendingPayerExpiry`] so the previously
     /// nominated address can no longer call [`StarfundEscrow::accept_payer_recovery`]. The current
@@ -10139,7 +10139,7 @@ impl StarfundEscrow {
     /// per entry.
     ///
     /// Already-refunded entries (where [`DataKey::InvestorRefunded`] is already `true`) are
-    /// **skipped** without failing the batch ΓÇö this makes the entrypoint idempotent and
+    /// **skipped** without failing the batch -- this makes the entrypoint idempotent and
     /// allows relayer-style retry without needing to prune the list.
     ///
     /// # Parameters
@@ -10149,7 +10149,7 @@ impl StarfundEscrow {
     /// - [`EscrowError::RefundBatchEmpty`] if `investors` is empty
     /// - [`EscrowError::RefundBatchTooLarge`] if `investors.len() > [`MAX_REFUND_BATCH`]
     ///
-    /// Per-entry errors (non-cancelled status, auth failure) are **not** silently skipped ΓÇö they
+    /// Per-entry errors (non-cancelled status, auth failure) are **not** silently skipped -- they
     /// terminate the entire batch. Entries with no recorded contribution (zero balance) and
     /// already-refunded entries (where [`DataKey::InvestorRefunded`] is `true`) are safely skipped.
     ///
@@ -10201,7 +10201,7 @@ impl StarfundEscrow {
     ///
     /// # Parameters
     /// - `investor`: The address whose contribution is being reduced. Must match `require_auth`.
-    /// - `amount`: The positive amount to withdraw (must be Γëñ recorded contribution).
+    /// - `amount`: The positive amount to withdraw (must be <= recorded contribution).
     ///
     /// # Errors
     /// - [`EscrowError::UnfundEscrowNotOpen`] if `status != 0`.
@@ -10357,7 +10357,7 @@ impl StarfundEscrow {
     /// [`StarfundEscrow::withdraw`], or [`StarfundEscrow::refund`].
     ///
     /// Used by [`StarfundEscrow::sweep_terminal_dust`] to compute outstanding liabilities.
-    /// Absent ΓçÆ `0` (no principal has been distributed).
+    /// Absent -> `0` (no principal has been distributed).
     pub fn get_distributed_principal(env: Env) -> i128 {
         env.storage()
             .instance()

@@ -50,6 +50,24 @@ pub use test_utils::{
 // dispute-release coverage enabled for the canonical repair path.
 mod dispute_release;
 
+// Storage XDR compatibility fixtures (issue #404).
+//
+// Provenance for the raw XDR fixtures under `escrow/src/tests/fixtures/`:
+//   - Source version: storage schema v5 (see `SCHEMA_VERSION` and
+//     docs/adr/ADR-007-storage-key-evolution.md).
+//   - Generation: fixtures are produced by serializing representative
+//     `DataKey` / `InvoiceEscrow` values with the v5 type definitions via
+//     `soroban_sdk::xdr` (`WriteXdr`) and committed as raw XDR bytes.
+//   - Commit: recorded alongside each fixture in `fixtures/README.md`.
+//   - Regeneration command: `cargo test -p starfund-escrow \
+//       storage_compat::regenerate_fixtures -- --ignored --nocapture`
+//     (see the module below for the exact serialization path).
+//
+// The tests decode each fixture with `ReadXdr`/`FromXdr` and compare semantic
+// fields against expected values. A breaking shape change fails unless a
+// migration path is registered (see `assert_migration_or_redeploy`).
+mod storage_compat;
+
 /// Registers a new escrow contract instance and returns its contract id.
 pub fn deploy_id(env: &Env) -> Address {
     env.register(StarfundEscrow, ())
